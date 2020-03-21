@@ -4,9 +4,10 @@ Reliable Allreduce and Broadcast Library.
 Author: Tianqi Chen
 """
 # pylint: disable=unused-argument,invalid-name,global-statement,dangerous-default-value,
-import cPickle as pickle
+import pickle
 import ctypes
 import os
+import platform
 import sys
 import warnings
 import numpy as np
@@ -62,6 +63,8 @@ def _loadlib(lib='standard', lib_dll=None):
 
     if os.name == 'nt':
         dll_name += '.dll'
+    elif platform.system() == 'Darwin':
+        dll_name += '.dylib'
     else:
         dll_name += '.so'
 
@@ -99,9 +102,10 @@ def init(args=None, lib='standard', lib_dll=None):
         When this is presented argument lib will be ignored.
     """
     if args is None:
-        args = sys.argv
+        args = []
     _loadlib(lib, lib_dll)
     arr = (ctypes.c_char_p * len(args))()
+
     arr[:] = args
     _LIB.RabitInit(len(args), arr)
 

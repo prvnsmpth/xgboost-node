@@ -2,7 +2,8 @@
 #include <cstdlib>
 #include <dmlc/logging.h>
 #include <dmlc/io.h>
-#include "../src/io/filesys.h"
+#include <dmlc/endian.h>
+#include <dmlc/filesystem.h>
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {

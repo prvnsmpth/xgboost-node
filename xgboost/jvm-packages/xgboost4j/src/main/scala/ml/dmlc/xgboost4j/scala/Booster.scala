@@ -16,8 +16,6 @@
 
 package ml.dmlc.xgboost4j.scala
 
-import java.io.IOException
-
 import com.esotericsoftware.kryo.io.{Output, Input}
 import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
 import ml.dmlc.xgboost4j.java.{Booster => JBooster}
@@ -25,8 +23,56 @@ import ml.dmlc.xgboost4j.java.XGBoostError
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-class Booster private[xgboost4j](private var booster: JBooster)
+/**
+  * Booster for xgboost, this is a model API that support interactive build of a XGBoost Model
+  *
+  * DEVELOPER WARNING: A Java Booster must not be shared by more than one Scala Booster
+  * @param booster the java booster object.
+  */
+class Booster private[xgboost4j](private[xgboost4j] var booster: JBooster)
   extends Serializable  with KryoSerializable {
+
+  /**
+   * Get attributes stored in the Booster as a Map.
+   *
+   * @return A map contain attribute pairs.
+   */
+  @throws(classOf[XGBoostError])
+  def getAttrs: Map[String, String] = {
+    booster.getAttrs.asScala.toMap
+  }
+
+  /**
+   * Get attribute from the Booster.
+   *
+   * @param key   attr name
+   * @return attr value
+   */
+  @throws(classOf[XGBoostError])
+  def getAttr(key: String): String = {
+    booster.getAttr(key)
+  }
+
+  /**
+   * Set attribute to the Booster.
+   *
+   * @param key   attr name
+   * @param value attr value
+   */
+  @throws(classOf[XGBoostError])
+  def setAttr(key: String, value: String): Unit = {
+    booster.setAttr(key, value)
+  }
+
+  /**
+   * set attributes
+   *
+   * @param params attributes key-value map
+   */
+  @throws(classOf[XGBoostError])
+  def setAttrs(params: Map[String, String]): Unit = {
+    booster.setAttrs(params.asJava)
+  }
 
   /**
     * Set parameter to the Booster.
@@ -121,8 +167,8 @@ class Booster private[xgboost4j](private var booster: JBooster)
    * @return predict result
    */
   @throws(classOf[XGBoostError])
-  def predict(data: DMatrix, outPutMargin: Boolean = false, treeLimit: Int = 0)
-      : Array[Array[Float]] = {
+  def predict(data: DMatrix, outPutMargin: Boolean = false, treeLimit: Int = 0):
+      Array[Array[Float]] = {
     booster.predict(data.jDMatrix, outPutMargin, treeLimit)
   }
 
@@ -135,7 +181,7 @@ class Booster private[xgboost4j](private var booster: JBooster)
    * @throws XGBoostError native error
    */
   @throws(classOf[XGBoostError])
-  def predictLeaf(data: DMatrix, treeLimit: Int = 0) : Array[Array[Float]] = {
+  def predictLeaf(data: DMatrix, treeLimit: Int = 0): Array[Array[Float]] = {
     booster.predictLeaf(data.jDMatrix, treeLimit)
   }
 
@@ -184,14 +230,68 @@ class Booster private[xgboost4j](private var booster: JBooster)
   }
 
   /**
-   * Get importance of each feature
+    * Dump model as Array of string with specified feature names.
+    *
+    * @param featureNames Names of features.
+    */
+  @throws(classOf[XGBoostError])
+  def getModelDump(featureNames: Array[String]): Array[String] = {
+    booster.getModelDump(featureNames, false, "text")
+  }
+
+  def getModelDump(featureNames: Array[String], withStats: Boolean, format: String)
+    : Array[String] = {
+    booster.getModelDump(featureNames, withStats, format)
+  }
+
+
+  /**
+   * Get importance of each feature based on weight only (number of splits)
    *
-   * @return featureMap  key: feature index, value: feature importance score
+   * @return featureScoreMap  key: feature index, value: feature importance score
    */
   @throws(classOf[XGBoostError])
   def getFeatureScore(featureMap: String = null): mutable.Map[String, Integer] = {
     booster.getFeatureScore(featureMap).asScala
   }
+
+  /**
+    * Get importance of each feature based on weight only
+    * (number of splits), with specified feature names.
+    *
+    * @return featureScoreMap  key: feature name, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getFeatureScore(featureNames: Array[String]): mutable.Map[String, Integer] = {
+    booster.getFeatureScore(featureNames).asScala
+  }
+
+  /**
+    * Get importance of each feature based on information gain or cover
+    * Supported: ["gain, "cover", "total_gain", "total_cover"]
+    *
+    * @return featureScoreMap  key: feature index, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getScore(featureMap: String, importanceType: String): Map[String, Double] = {
+    Map(booster.getScore(featureMap, importanceType)
+        .asScala.mapValues(_.doubleValue).toSeq: _*)
+  }
+
+  /**
+    * Get importance of each feature based on information gain or cover
+    * , with specified feature names.
+    * Supported: ["gain, "cover", "total_gain", "total_cover"]
+    *
+    * @return featureScoreMap  key: feature name, value: feature importance score
+    */
+  @throws(classOf[XGBoostError])
+  def getScore(featureNames: Array[String], importanceType: String): Map[String, Double] = {
+    Map(booster.getScore(featureNames, importanceType)
+        .asScala.mapValues(_.doubleValue).toSeq: _*)
+  }
+
+  def getVersion: Int = booster.getVersion
 
   def toByteArray: Array[Byte] = {
     booster.toByteArray

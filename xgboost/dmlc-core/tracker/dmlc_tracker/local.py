@@ -9,23 +9,11 @@ import logging
 from threading import Thread
 from . import tracker
 
-keepalive = """
-nrep=0
-rc=254
-while [ $rc -ne 0 ];
-do
-    export DMLC_NUM_ATTEMPT=$nrep
-    %s
-    rc=$?;
-    nrep=$((nrep+1));
-done
-"""
-
-def exec_cmd(cmd, role, taskid, pass_env):
+def exec_cmd(cmd, num_attempt, role, taskid, pass_env):
     """Execute the command line command."""
     if cmd[0].find('/') == -1 and os.path.exists(cmd[0]) and os.name != 'nt':
         cmd[0] = './' + cmd[0]
-    cmd = ' '.join(cmd)
+    cmdline = ' '.join(cmd)
     env = os.environ.copy()
     for k, v in pass_env.items():
         env[k] = str(v)
@@ -34,25 +22,31 @@ def exec_cmd(cmd, role, taskid, pass_env):
     env['DMLC_ROLE'] = role
     env['DMLC_JOB_CLUSTER'] = 'local'
 
-    ntrial = 0
+    # backward compatibility
+    num_retry = env.get('DMLC_NUM_ATTEMPT', num_attempt)
+    num_trial = 0
+
+    logging.debug('num of retry %d',num_retry)
+
     while True:
         if os.name == 'nt':
-            env['DMLC_NUM_ATTEMPT'] = str(ntrial)
-            ret = subprocess.call(cmd, shell=True, env=env)
-            if ret != 0:
-                ntrial += 1
-                continue
+            ret = subprocess.call(cmdline, shell=True, env=env)
         else:
-            bash = keepalive % (cmd)
-            ret = subprocess.call(bash, shell=True, executable='bash', env=env)
+            ret = subprocess.call(cmdline, shell=True, executable='bash', env=env)
         if ret == 0:
             logging.debug('Thread %d exit with 0', taskid)
             return
         else:
+            num_trial += 1
+            num_retry -= 1
+
+            if num_retry >= 0:
+                cmdline = ' '.join(cmd + ['DMLC_NUM_ATTEMPT=' + str(num_trial)])
+                continue
             if os.name == 'nt':
                 sys.exit(-1)
             else:
-                raise RuntimeError('Get nonzero return code=%d' % ret)
+                raise RuntimeError('Get nonzero return code=%d on %s %s' % (ret, cmd, env))
 
 
 def submit(args):
@@ -74,7 +68,7 @@ def submit(args):
                 role = 'worker'
             else:
                 role = 'server'
-            procs[i] = Thread(target=exec_cmd, args=(args.command, role, i, envs))
+            procs[i] = Thread(target=exec_cmd, args=(args.command, args.local_num_attempt, role, i, envs))
             procs[i].setDaemon(True)
             procs[i].start()
 

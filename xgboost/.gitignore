@@ -15,10 +15,9 @@
 *.Rcheck
 *.rds
 *.tar.gz
-#*txt*
 *conf
 *buffer
-*model
+*.model
 *pyc
 *.train
 *.test
@@ -47,13 +46,12 @@ Debug
 *.cpage.col
 *.cpage
 *.Rproj
-./xgboost
 ./xgboost.mpi
 ./xgboost.mock
 #.Rbuildignore
 R-package.Rproj
 *.cache*
-#java
+# java
 java/xgboost4j/target
 java/xgboost4j/tmp
 java/xgboost4j-demo/target
@@ -67,12 +65,12 @@ nb-configuration*
 .pydevproject
 .settings/
 build
+config.mk
+/xgboost
 *.data
 build_plugin
-.idea
 recommonmark/
 tags
-*.iml
 *.class
 target
 *.swp
@@ -85,8 +83,24 @@ build_tests
 /tests/cpp/xgboost_test
 
 .DS_Store
+lib/
 
 # spark
 metastore_db
 
-plugin/updater_gpu/test/cpp/data
+/include/xgboost/build_config.h
+
+# files from R-package source install
+**/config.status
+R-package/src/Makevars
+
+# Visual Studio Code
+/.vscode/
+
+# IntelliJ/CLion
+.idea
+*.iml
+/cmake-build-debug/
+
+# GDB
+.gdb_history

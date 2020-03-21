@@ -16,6 +16,20 @@ endif
 
 ROOTDIR = $(CURDIR)
 
+# workarounds for some buggy old make & msys2 versions seen in windows
+ifeq (NA, $(shell test ! -d "$(ROOTDIR)" && echo NA ))
+        $(warning Attempting to fix non-existing ROOTDIR [$(ROOTDIR)])
+        ROOTDIR := $(shell pwd)
+        $(warning New ROOTDIR [$(ROOTDIR)] $(shell test -d "$(ROOTDIR)" && echo " is OK" ))
+endif
+MAKE_OK := $(shell "$(MAKE)" -v 2> /dev/null)
+ifndef MAKE_OK
+        $(warning Attempting to recover non-functional MAKE [$(MAKE)])
+        MAKE := $(shell which make 2> /dev/null)
+        MAKE_OK := $(shell "$(MAKE)" -v 2> /dev/null)
+endif
+$(warning MAKE [$(MAKE)] - $(if $(MAKE_OK),checked OK,PROBLEM))
+
 ifeq ($(OS), Windows_NT)
 	UNAME="Windows"
 else
@@ -27,11 +41,6 @@ ifeq ($(USE_OPENMP), 0)
 	export NO_OPENMP = 1
 endif
 include $(DMLC_CORE)/make/dmlc.mk
-
-# include the plugins
-ifdef XGB_PLUGINS
-include $(XGB_PLUGINS)
-endif
 
 # set compiler defaults for OSX versus *nix
 # let people override either
@@ -53,8 +62,8 @@ export CXX = g++
 endif
 endif
 
-export LDFLAGS= -pthread -lm $(ADD_LDFLAGS) $(DMLC_LDFLAGS) $(PLUGIN_LDFLAGS)
-export CFLAGS=  -std=c++11 -Wall -Wno-unknown-pragmas -Iinclude $(ADD_CFLAGS) $(PLUGIN_CFLAGS)
+export LDFLAGS= -pthread -lm $(ADD_LDFLAGS) $(DMLC_LDFLAGS)
+export CFLAGS= -DDMLC_LOG_CUSTOMIZE=1 -std=c++11 -Wall -Wno-unknown-pragmas -Iinclude $(ADD_CFLAGS)
 CFLAGS += -I$(DMLC_CORE)/include -I$(RABIT)/include -I$(GTEST_PATH)/include
 #java include path
 export JAVAINCFLAGS = -I${JAVA_HOME}/include -I./java
@@ -62,7 +71,10 @@ export JAVAINCFLAGS = -I${JAVA_HOME}/include -I./java
 ifeq ($(TEST_COVER), 1)
 	CFLAGS += -g -O0 -fprofile-arcs -ftest-coverage
 else
-	CFLAGS += -O3 -funroll-loops -msse2
+	CFLAGS += -O3 -funroll-loops
+ifeq ($(USE_SSE), 1)
+	CFLAGS += -msse2
+endif
 endif
 
 ifndef LINT_LANG
@@ -70,7 +82,7 @@ ifndef LINT_LANG
 endif
 
 ifeq ($(UNAME), Windows)
-	XGBOOST_DYLIB = lib/libxgboost.dll
+	XGBOOST_DYLIB = lib/xgboost.dll
 	JAVAINCFLAGS += -I${JAVA_HOME}/include/win32
 else
 ifeq ($(UNAME), Darwin)
@@ -99,66 +111,31 @@ else
 endif
 CFLAGS += $(OPENMP_FLAGS)
 
-# for using GPUs
-GPU_COMPUTE_VER ?= 35 50 52 60 61
-NVCC = nvcc
-INCLUDES = -Iinclude -I$(DMLC_CORE)/include -I$(RABIT)/include
-INCLUDES += -I$(CUB_PATH)
-INCLUDES += -I$(GTEST_PATH)/include
-CODE = $(foreach ver,$(GPU_COMPUTE_VER),-gencode arch=compute_$(ver),code=sm_$(ver))
-NVCC_FLAGS = --std=c++11 $(CODE) $(INCLUDES) -lineinfo --expt-extended-lambda
-NVCC_FLAGS += -Xcompiler=$(OPENMP_FLAGS) -Xcompiler=-fPIC
-ifeq ($(PLUGIN_UPDATER_GPU),ON)
-  CUDA_ROOT = $(shell dirname $(shell dirname $(shell which $(NVCC))))
-  INCLUDES += -I$(CUDA_ROOT)/include -Inccl/src/
-  LDFLAGS += -L$(CUDA_ROOT)/lib64 -lcudart  -lcudadevrt -Lnccl/build/lib/ -lnccl_static -lm -ldl -lrt
-endif
-
 # specify tensor path
 .PHONY: clean all lint clean_all doxygen rcpplint pypack Rpack Rbuild Rcheck java pylint
 
 all: lib/libxgboost.a $(XGBOOST_DYLIB) xgboost
 
 $(DMLC_CORE)/libdmlc.a: $(wildcard $(DMLC_CORE)/src/*.cc $(DMLC_CORE)/src/*/*.cc)
-	+ cd $(DMLC_CORE); $(MAKE) libdmlc.a config=$(ROOTDIR)/$(config); cd $(ROOTDIR)
+	+ cd $(DMLC_CORE); "$(MAKE)" libdmlc.a config=$(ROOTDIR)/$(config); cd $(ROOTDIR)
 
 $(RABIT)/lib/$(LIB_RABIT): $(wildcard $(RABIT)/src/*.cc)
-	+ cd $(RABIT); $(MAKE) lib/$(LIB_RABIT); cd $(ROOTDIR)
+	+ cd $(RABIT); "$(MAKE)" lib/$(LIB_RABIT) USE_SSE=$(USE_SSE); cd $(ROOTDIR)
 
 jvm: jvm-packages/lib/libxgboost4j.so
 
 SRC = $(wildcard src/*.cc src/*/*.cc)
-ALL_OBJ = $(patsubst src/%.cc, build/%.o, $(SRC)) $(PLUGIN_OBJS)
+ALL_OBJ = $(patsubst src/%.cc, build/%.o, $(SRC))
 AMALGA_OBJ = amalgamation/xgboost-all0.o
 LIB_DEP = $(DMLC_CORE)/libdmlc.a $(RABIT)/lib/$(LIB_RABIT)
 ALL_DEP = $(filter-out build/cli_main.o, $(ALL_OBJ)) $(LIB_DEP)
 CLI_OBJ = build/cli_main.o
 include tests/cpp/xgboost_test.mk
 
-# order of this rule matters wrt %.cc rule below!
-build/%.o: src/%.cu
-	@mkdir -p $(@D)
-	$(NVCC) -c $(NVCC_FLAGS) $< -o $@
-
 build/%.o: src/%.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CFLAGS) -MM -MT build/$*.o $< >build/$*.d
 	$(CXX) -c $(CFLAGS) $< -o $@
-
-# order of this rule matters wrt %.cc rule below!
-build_plugin/%.o: plugin/%.cu build_nccl
-	@mkdir -p $(@D)
-	$(NVCC) -c $(NVCC_FLAGS) $< -o $@
-
-build_plugin/%.o: plugin/%.cc
-	@mkdir -p $(@D)
-	$(CXX) $(CFLAGS) -MM -MT build_plugin/$*.o $< >build_plugin/$*.d
-	$(CXX) -c $(CFLAGS) $< -o $@
-
-build_nccl:
-	@mkdir -p build/include
-	cd build/include ; ln -sf ../../nccl/src/nccl.h .
-	cd nccl ; make -j ; cd ..
 
 # The should be equivalent to $(ALL_OBJ)  except for build/cli_main.o
 amalgamation/xgboost-all0.o: amalgamation/xgboost-all0.cc
@@ -173,7 +150,7 @@ lib/libxgboost.a: $(ALL_DEP)
 	@mkdir -p $(@D)
 	ar crv $@ $(filter %.o, $?)
 
-lib/libxgboost.dll lib/libxgboost.so lib/libxgboost.dylib: $(ALL_DEP)
+lib/xgboost.dll lib/libxgboost.so lib/libxgboost.dylib: $(ALL_DEP)
 	@mkdir -p $(@D)
 	$(CXX) $(CFLAGS) -shared -o $@ $(filter %.o %a,  $^) $(LDFLAGS)
 
@@ -186,17 +163,20 @@ xgboost: $(CLI_OBJ) $(ALL_DEP)
 	$(CXX) $(CFLAGS) -o $@  $(filter %.o %.a, $^)  $(LDFLAGS)
 
 rcpplint:
-	python2 dmlc-core/scripts/lint.py xgboost ${LINT_LANG} R-package/src
+	python3 dmlc-core/scripts/lint.py xgboost ${LINT_LANG} R-package/src
 
 lint: rcpplint
-	python2 dmlc-core/scripts/lint.py xgboost ${LINT_LANG} include src plugin python-package
+	python3 dmlc-core/scripts/lint.py --exclude_path python-package/xgboost/dmlc-core \
+	  python-package/xgboost/include python-package/xgboost/lib \
+	  python-package/xgboost/make python-package/xgboost/rabit \
+	  python-package/xgboost/src --pylint-rc ${PWD}/python-package/.pylintrc xgboost \
+	  ${LINT_LANG} include src python-package
 
 pylint:
 	flake8 --ignore E501 python-package
 	flake8 --ignore E501 tests/python
 
 test: $(ALL_TEST)
-	./plugin/updater_gpu/test/cpp/generate_data.sh
 	$(ALL_TEST)
 
 check: test
@@ -210,36 +190,32 @@ cover: check
 endif
 
 clean:
-	$(RM) -rf build build_plugin lib bin *~ */*~ */*/*~ */*/*/*~ */*.o */*/*.o */*/*/*.o xgboost
+	$(RM) -rf build lib bin *~ */*~ */*/*~ */*/*/*~ */*.o */*/*.o */*/*/*.o #xgboost
 	$(RM) -rf build_tests *.gcov tests/cpp/xgboost_test
+	if [ -d "R-package/src" ]; then \
+		cd R-package/src; \
+		$(RM) -rf rabit src include dmlc-core amalgamation *.so *.dll; \
+		cd $(ROOTDIR); \
+	fi
 
 clean_all: clean
-	cd $(DMLC_CORE); $(MAKE) clean; cd $(ROOTDIR)
-	cd $(RABIT); $(MAKE) clean; cd $(ROOTDIR)
+	cd $(DMLC_CORE); "$(MAKE)" clean; cd $(ROOTDIR)
+	cd $(RABIT); "$(MAKE)" clean; cd $(ROOTDIR)
 
 doxygen:
 	doxygen doc/Doxyfile
 
 # create standalone python tar file.
 pypack: ${XGBOOST_DYLIB}
-	cp ${XGBOOST_DYLIB} python-package/xgboost
+	cp ${XGBOOST_DYLIB} python-package/xgboost/lib
 	cd python-package; tar cf xgboost.tar xgboost; cd ..
 
-# create pip installation pack for PyPI
-pippack:
-	$(MAKE) clean_all
-	rm -rf xgboost-python
-	cp -r python-package xgboost-python
-	cp -r Makefile xgboost-python/xgboost/
-	cp -r make xgboost-python/xgboost/
-	cp -r src xgboost-python/xgboost/
-	cp -r include xgboost-python/xgboost/
-	cp -r dmlc-core xgboost-python/xgboost/
-	cp -r rabit xgboost-python/xgboost/
+# create pip source dist (sdist) pack for PyPI
+pippack: clean_all
+	cd python-package; python setup.py sdist; mv dist/*.tar.gz ..; cd ..
 
 # Script to make a clean installable R package.
-Rpack:
-	$(MAKE) clean_all
+Rpack: clean_all
 	rm -rf xgboost xgboost*.tar.gz
 	cp -r R-package xgboost
 	rm -rf xgboost/src/*.o xgboost/src/*.so xgboost/src/*.dll
@@ -257,19 +233,26 @@ Rpack:
 	cp -r dmlc-core/include xgboost/src/dmlc-core/include
 	cp -r dmlc-core/src xgboost/src/dmlc-core/src
 	cp ./LICENSE xgboost
-	cat R-package/src/Makevars.in|sed '2s/.*/PKGROOT=./' | sed '3s/.*/ENABLE_STD_THREAD=0/' > xgboost/src/Makevars.in
+# Modify PKGROOT in Makevars.in
+	cat R-package/src/Makevars.in|sed '2s/.*/PKGROOT=./' > xgboost/src/Makevars.in
+# Configure Makevars.win (Windows-specific Makevars, likely using MinGW)
 	cp xgboost/src/Makevars.in xgboost/src/Makevars.win
-	sed -i -e 's/@OPENMP_CXXFLAGS@/$$\(SHLIB_OPENMP_CFLAGS\)/g' xgboost/src/Makevars.win
+	cat xgboost/src/Makevars.in| sed '3s/.*/ENABLE_STD_THREAD=0/' > xgboost/src/Makevars.win
+	sed -i -e 's/@OPENMP_CXXFLAGS@/$$\(SHLIB_OPENMP_CXXFLAGS\)/g' xgboost/src/Makevars.win
+	sed -i -e 's/-pthread/$$\(SHLIB_PTHREAD_FLAGS\)/g' xgboost/src/Makevars.win
+	sed -i -e 's/@ENDIAN_FLAG@/-DDMLC_CMAKE_LITTLE_ENDIAN=1/g' xgboost/src/Makevars.win
+	sed -i -e 's/@BACKTRACE_LIB@//g' xgboost/src/Makevars.win
+	sed -i -e 's/@OPENMP_LIB@//g' xgboost/src/Makevars.win
+	rm -f xgboost/src/Makevars.win-e   # OSX sed create this extra file; remove it
+	bash R-package/remove_warning_suppression_pragma.sh
+	rm xgboost/remove_warning_suppression_pragma.sh
 
-Rbuild:
-	$(MAKE) Rpack
+Rbuild: Rpack
 	R CMD build --no-build-vignettes xgboost
 	rm -rf xgboost
 
-Rcheck:
-	$(MAKE) Rbuild
-	R CMD check  xgboost*.tar.gz
+Rcheck: Rbuild
+	R CMD check xgboost*.tar.gz
 
 -include build/*.d
 -include build/*/*.d
--include build_plugin/*/*.d

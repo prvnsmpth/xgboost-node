@@ -18,56 +18,103 @@ package ml.dmlc.xgboost4j.scala.spark.params
 
 import scala.collection.immutable.HashSet
 
-import org.apache.spark.ml.param.{DoubleParam, IntParam, Param, Params}
+import org.apache.spark.ml.param._
 
-trait LearningTaskParams extends Params {
-
-  /**
-   * number of tasks to learn
-   */
-  val numClasses = new IntParam(this, "num_class", "number of classes")
+private[spark] trait LearningTaskParams extends Params {
 
   /**
    * Specify the learning task and the corresponding learning objective.
-   * options: reg:linear, reg:logistic, binary:logistic, binary:logitraw, count:poisson,
-   * multi:softmax, multi:softprob, rank:pairwise, reg:gamma. default: reg:linear
+   * options: reg:squarederror, reg:squaredlogerror, reg:logistic, binary:logistic, binary:logitraw,
+   * count:poisson, multi:softmax, multi:softprob, rank:pairwise, reg:gamma.
+   * default: reg:squarederror
    */
-  val objective = new Param[String](this, "objective", "objective function used for training," +
-    s" options: {${LearningTaskParams.supportedObjective.mkString(",")}",
-    (value: String) => LearningTaskParams.supportedObjective.contains(value))
+  final val objective = new Param[String](this, "objective",
+    "objective function used for training")
+
+  final def getObjective: String = $(objective)
+
+  /**
+   * The learning objective type of the specified custom objective and eval.
+   * Corresponding type will be assigned if custom objective is defined
+   * options: regression, classification. default: null
+   */
+  final val objectiveType = new Param[String](this, "objectiveType", "objective type used for " +
+    s"training, options: {${LearningTaskParams.supportedObjectiveType.mkString(",")}",
+    (value: String) => LearningTaskParams.supportedObjectiveType.contains(value))
+
+  final def getObjectiveType: String = $(objectiveType)
+
 
   /**
    * the initial prediction score of all instances, global bias. default=0.5
    */
-  val baseScore = new DoubleParam(this, "base_score", "the initial prediction score of all" +
+  final val baseScore = new DoubleParam(this, "baseScore", "the initial prediction score of all" +
     " instances, global bias")
+
+  final def getBaseScore: Double = $(baseScore)
 
   /**
    * evaluation metrics for validation data, a default metric will be assigned according to
    * objective(rmse for regression, and error for classification, mean average precision for
-   * ranking). options: rmse, mae, logloss, error, merror, mlogloss, auc, ndcg, map, gamma-deviance
+   * ranking). options: rmse, rmsle, mae, logloss, error, merror, mlogloss, auc, aucpr, ndcg, map,
+   * gamma-deviance
    */
-  val evalMetric = new Param[String](this, "eval_metric", "evaluation metrics for validation" +
-    " data, a default metric will be assigned according to objective (rmse for regression, and" +
-    " error for classification, mean average precision for ranking), options: " +
-    s" {${LearningTaskParams.supportedEvalMetrics.mkString(",")}}",
-    (value: String) => LearningTaskParams.supportedEvalMetrics.contains(value))
+  final val evalMetric = new Param[String](this, "evalMetric", "evaluation metrics for " +
+    "validation data, a default metric will be assigned according to objective " +
+    "(rmse for regression, and error for classification, mean average precision for ranking)")
+
+  final def getEvalMetric: String = $(evalMetric)
 
   /**
-    * group data specify each group sizes for ranking task. To correspond to partition of
-    * training data, it is nested.
-    */
-  val groupData = new GroupDataParam(this, "groupData", "group data specify each group size" +
-    " for ranking task. To correspond to partition of training data, it is nested.")
+   * Fraction of training points to use for testing.
+   */
+  final val trainTestRatio = new DoubleParam(this, "trainTestRatio",
+    "fraction of training points to use for testing",
+    ParamValidators.inRange(0, 1))
 
-  setDefault(objective -> "reg:linear", baseScore -> 0.5, numClasses -> 2, groupData -> null)
+  final def getTrainTestRatio: Double = $(trainTestRatio)
+
+  /**
+   * whether caching training data
+   */
+  final val cacheTrainingSet = new BooleanParam(this, "cacheTrainingSet",
+    "whether caching training data")
+
+  /**
+   * whether cleaning checkpoint, always cleaning by default, having this parameter majorly for
+   * testing
+   */
+  final val skipCleanCheckpoint = new BooleanParam(this, "skipCleanCheckpoint",
+    "whether cleaning checkpoint data")
+
+  /**
+   * If non-zero, the training will be stopped after a specified number
+   * of consecutive increases in any evaluation metric.
+   */
+  final val numEarlyStoppingRounds = new IntParam(this, "numEarlyStoppingRounds",
+    "number of rounds of decreasing eval metric to tolerate before " +
+    "stopping the training",
+    (value: Int) => value == 0 || value > 1)
+
+  final def getNumEarlyStoppingRounds: Int = $(numEarlyStoppingRounds)
+
+
+  final val maximizeEvaluationMetrics = new BooleanParam(this, "maximizeEvaluationMetrics",
+    "define the expected optimization to the evaluation metrics, true to maximize otherwise" +
+      " minimize it")
+
+  final def getMaximizeEvaluationMetrics: Boolean = $(maximizeEvaluationMetrics)
+
+  setDefault(objective -> "reg:squarederror", baseScore -> 0.5,
+    trainTestRatio -> 1.0, numEarlyStoppingRounds -> 0, cacheTrainingSet -> false)
 }
 
 private[spark] object LearningTaskParams {
-  val supportedObjective = HashSet("reg:linear", "reg:logistic", "binary:logistic",
-    "binary:logitraw", "count:poisson", "multi:softmax", "multi:softprob", "rank:pairwise",
-    "reg:gamma")
 
-  val supportedEvalMetrics = HashSet("rmse", "mae", "logloss", "error", "merror", "mlogloss",
-    "auc", "ndcg", "map", "gamma-deviance")
+  val supportedObjectiveType = HashSet("regression", "classification")
+
+  val evalMetricsToMaximize = HashSet("auc", "aucpr", "ndcg", "map")
+
+  val evalMetricsToMinimize = HashSet("rmse", "rmsle", "mae", "logloss", "error", "merror",
+    "mlogloss", "gamma-deviance")
 }

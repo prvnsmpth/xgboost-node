@@ -1,249 +1,181 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014~2020 by Contributors
  * \file simple_dmatrix.cc
  * \brief the input data structure for gradient boosting
  * \author Tianqi Chen
  */
-#include <xgboost/data.h>
-#include <limits>
-#include <algorithm>
-#include <vector>
 #include "./simple_dmatrix.h"
+#include <xgboost/data.h>
+#include "./simple_batch_iterator.h"
 #include "../common/random.h"
-#include "../common/group_data.h"
+#include "adapter.h"
 
 namespace xgboost {
 namespace data {
+MetaInfo& SimpleDMatrix::Info() { return info; }
 
-bool SimpleDMatrix::ColBatchIter::Next() {
-  if (data_ptr_ >= cpages_.size()) return false;
-  data_ptr_ += 1;
-  SparsePage* pcol = cpages_[data_ptr_ - 1].get();
-  batch_.size = col_index_.size();
-  col_data_.resize(col_index_.size(), SparseBatch::Inst(NULL, 0));
-  for (size_t i = 0; i < col_data_.size(); ++i) {
-    const bst_uint ridx = col_index_[i];
-    col_data_[i] = SparseBatch::Inst
-        (dmlc::BeginPtr(pcol->data) + pcol->offset[ridx],
-         static_cast<bst_uint>(pcol->offset[ridx + 1] - pcol->offset[ridx]));
-  }
-  batch_.col_index = dmlc::BeginPtr(col_index_);
-  batch_.col_data = dmlc::BeginPtr(col_data_);
-  return true;
+const MetaInfo& SimpleDMatrix::Info() const { return info; }
+
+BatchSet<SparsePage> SimpleDMatrix::GetRowBatches() {
+  // since csr is the default data structure so `source_` is always available.
+  auto begin_iter = BatchIterator<SparsePage>(
+      new SimpleBatchIteratorImpl<SparsePage>(&sparse_page_));
+  return BatchSet<SparsePage>(begin_iter);
 }
 
-dmlc::DataIter<ColBatch>* SimpleDMatrix::ColIterator() {
-  size_t ncol = this->info().num_col;
-  col_iter_.col_index_.resize(ncol);
-  for (size_t i = 0; i < ncol; ++i) {
-    col_iter_.col_index_[i] = static_cast<bst_uint>(i);
+BatchSet<CSCPage> SimpleDMatrix::GetColumnBatches() {
+  // column page doesn't exist, generate it
+  if (!column_page_) {
+    column_page_.reset(new CSCPage(sparse_page_.GetTranspose(info.num_col_)));
   }
-  col_iter_.BeforeFirst();
-  return &col_iter_;
+  auto begin_iter =
+      BatchIterator<CSCPage>(new SimpleBatchIteratorImpl<CSCPage>(column_page_.get()));
+  return BatchSet<CSCPage>(begin_iter);
 }
 
-dmlc::DataIter<ColBatch>* SimpleDMatrix::ColIterator(const std::vector<bst_uint>&fset) {
-  size_t ncol = this->info().num_col;
-  col_iter_.col_index_.resize(0);
-  for (size_t i = 0; i < fset.size(); ++i) {
-    if (fset[i] < ncol) col_iter_.col_index_.push_back(fset[i]);
+BatchSet<SortedCSCPage> SimpleDMatrix::GetSortedColumnBatches() {
+  // Sorted column page doesn't exist, generate it
+  if (!sorted_column_page_) {
+    sorted_column_page_.reset(
+        new SortedCSCPage(sparse_page_.GetTranspose(info.num_col_)));
+    sorted_column_page_->SortRows();
   }
-  col_iter_.BeforeFirst();
-  return &col_iter_;
+  auto begin_iter = BatchIterator<SortedCSCPage>(
+      new SimpleBatchIteratorImpl<SortedCSCPage>(sorted_column_page_.get()));
+  return BatchSet<SortedCSCPage>(begin_iter);
 }
 
-void SimpleDMatrix::InitColAccess(const std::vector<bool> &enabled,
-                                  float pkeep,
-                                  size_t max_row_perbatch) {
-  if (this->HaveColAccess()) return;
+BatchSet<EllpackPage> SimpleDMatrix::GetEllpackBatches(const BatchParam& param) {
+  // ELLPACK page doesn't exist, generate it
+  if (!(batch_param_ != BatchParam{})) {
+    CHECK(param != BatchParam{}) << "Batch parameter is not initialized.";
+  }
+  if (!ellpack_page_  || (batch_param_ != param && param != BatchParam{})) {
+    CHECK_GE(param.gpu_id, 0);
+    CHECK_GE(param.max_bin, 2);
+    ellpack_page_.reset(new EllpackPage(this, param));
+    batch_param_ = param;
+  }
+  auto begin_iter =
+      BatchIterator<EllpackPage>(new SimpleBatchIteratorImpl<EllpackPage>(ellpack_page_.get()));
+  return BatchSet<EllpackPage>(begin_iter);
+}
 
-  col_iter_.cpages_.clear();
-  if (info().num_row < max_row_perbatch) {
-    std::unique_ptr<SparsePage> page(new SparsePage());
-    this->MakeOneBatch(enabled, pkeep, page.get());
-    col_iter_.cpages_.push_back(std::move(page));
+template <typename AdapterT>
+SimpleDMatrix::SimpleDMatrix(AdapterT* adapter, float missing, int nthread) {
+  // Set number of threads but keep old value so we can reset it after
+  const int nthreadmax = omp_get_max_threads();
+  if (nthread <= 0) nthread = nthreadmax;
+  int nthread_original = omp_get_max_threads();
+  omp_set_num_threads(nthread);
+
+  std::vector<uint64_t> qids;
+  uint64_t default_max = std::numeric_limits<uint64_t>::max();
+  uint64_t last_group_id = default_max;
+  bst_uint group_size = 0;
+  auto& offset_vec = sparse_page_.offset.HostVector();
+  auto& data_vec = sparse_page_.data.HostVector();
+  uint64_t inferred_num_columns = 0;
+
+  adapter->BeforeFirst();
+  // Iterate over batches of input data
+  while (adapter->Next()) {
+    auto& batch = adapter->Value();
+    auto batch_max_columns = sparse_page_.Push(batch, missing, nthread);
+    inferred_num_columns = std::max(batch_max_columns, inferred_num_columns);
+    // Append meta information if available
+    if (batch.Labels() != nullptr) {
+      auto& labels = info.labels_.HostVector();
+      labels.insert(labels.end(), batch.Labels(),
+                    batch.Labels() + batch.Size());
+    }
+    if (batch.Weights() != nullptr) {
+      auto& weights = info.weights_.HostVector();
+      weights.insert(weights.end(), batch.Weights(),
+                     batch.Weights() + batch.Size());
+    }
+    if (batch.BaseMargin() != nullptr) {
+      auto& base_margin = info.base_margin_.HostVector();
+      base_margin.insert(base_margin.end(), batch.BaseMargin(),
+                     batch.BaseMargin() + batch.Size());
+    }
+    if (batch.Qid() != nullptr) {
+      qids.insert(qids.end(), batch.Qid(), batch.Qid() + batch.Size());
+      // get group
+      for (size_t i = 0; i < batch.Size(); ++i) {
+        const uint64_t cur_group_id = batch.Qid()[i];
+        if (last_group_id == default_max || last_group_id != cur_group_id) {
+          info.group_ptr_.push_back(group_size);
+        }
+        last_group_id = cur_group_id;
+        ++group_size;
+      }
+    }
+  }
+
+  if (last_group_id != default_max) {
+    if (group_size > info.group_ptr_.back()) {
+      info.group_ptr_.push_back(group_size);
+    }
+  }
+
+  // Deal with empty rows/columns if necessary
+  if (adapter->NumColumns() == kAdapterUnknownSize) {
+    info.num_col_ = inferred_num_columns;
   } else {
-    this->MakeManyBatch(enabled, pkeep, max_row_perbatch);
+    info.num_col_ = adapter->NumColumns();
   }
-  // setup col-size
-  col_size_.resize(info().num_col);
-  std::fill(col_size_.begin(), col_size_.end(), 0);
-  for (size_t i = 0; i < col_iter_.cpages_.size(); ++i) {
-    SparsePage *pcol = col_iter_.cpages_[i].get();
-    for (size_t j = 0; j < pcol->Size(); ++j) {
-      col_size_[j] += pcol->offset[j + 1] - pcol->offset[j];
+  // Synchronise worker columns
+  rabit::Allreduce<rabit::op::Max>(&info.num_col_, 1);
+
+  if (adapter->NumRows() == kAdapterUnknownSize) {
+    info.num_row_ = offset_vec.size() - 1;
+  } else {
+    if (offset_vec.empty()) {
+      offset_vec.emplace_back(0);
     }
+
+    while (offset_vec.size() - 1 < adapter->NumRows()) {
+      offset_vec.emplace_back(offset_vec.back());
+    }
+    info.num_row_ = adapter->NumRows();
   }
+  info.num_nonzero_ = data_vec.size();
+  omp_set_num_threads(nthread_original);
 }
 
-// internal function to make one batch from row iter.
-void SimpleDMatrix::MakeOneBatch(const std::vector<bool>& enabled,
-                                 float pkeep,
-                                 SparsePage *pcol) {
-  // clear rowset
-  buffered_rowset_.clear();
-  // bit map
-  const int nthread = omp_get_max_threads();
-  std::vector<bool> bmap;
-  pcol->Clear();
-  common::ParallelGroupBuilder<SparseBatch::Entry>
-      builder(&pcol->offset, &pcol->data);
-  builder.InitBudget(info().num_col, nthread);
-  // start working
-  dmlc::DataIter<RowBatch>* iter = this->RowIterator();
-  iter->BeforeFirst();
-  while (iter->Next()) {
-    const RowBatch& batch = iter->Value();
-    bmap.resize(bmap.size() + batch.size, true);
-    std::bernoulli_distribution coin_flip(pkeep);
-    auto& rnd = common::GlobalRandom();
-
-    long batch_size = static_cast<long>(batch.size); // NOLINT(*)
-    for (long i = 0; i < batch_size; ++i) { // NOLINT(*)
-      bst_uint ridx = static_cast<bst_uint>(batch.base_rowid + i);
-      if (pkeep == 1.0f || coin_flip(rnd)) {
-        buffered_rowset_.push_back(ridx);
-      } else {
-        bmap[i] = false;
-      }
-    }
-    #pragma omp parallel for schedule(static)
-    for (long i = 0; i < batch_size; ++i) { // NOLINT(*)
-      int tid = omp_get_thread_num();
-      bst_uint ridx = static_cast<bst_uint>(batch.base_rowid + i);
-      if (bmap[ridx]) {
-        RowBatch::Inst inst = batch[i];
-        for (bst_uint j = 0; j < inst.length; ++j) {
-          if (enabled[inst[j].index]) {
-            builder.AddBudget(inst[j].index, tid);
-          }
-        }
-      }
-    }
-  }
-  builder.InitStorage();
-
-  iter->BeforeFirst();
-  while (iter->Next()) {
-    const RowBatch& batch = iter->Value();
-    #pragma omp parallel for schedule(static)
-    for (long i = 0; i < static_cast<long>(batch.size); ++i) { // NOLINT(*)
-      int tid = omp_get_thread_num();
-      bst_uint ridx = static_cast<bst_uint>(batch.base_rowid + i);
-      if (bmap[ridx]) {
-        RowBatch::Inst inst = batch[i];
-        for (bst_uint j = 0; j < inst.length; ++j) {
-          if (enabled[inst[j].index]) {
-            builder.Push(inst[j].index,
-                         SparseBatch::Entry((bst_uint)(batch.base_rowid+i),
-                                            inst[j].fvalue), tid);
-          }
-        }
-      }
-    }
-  }
-
-  CHECK_EQ(pcol->Size(), info().num_col);
-  // sort columns
-  bst_omp_uint ncol = static_cast<bst_omp_uint>(pcol->Size());
-  #pragma omp parallel for schedule(dynamic, 1) num_threads(nthread)
-  for (bst_omp_uint i = 0; i < ncol; ++i) {
-    if (pcol->offset[i] < pcol->offset[i + 1]) {
-      std::sort(dmlc::BeginPtr(pcol->data) + pcol->offset[i],
-                dmlc::BeginPtr(pcol->data) + pcol->offset[i + 1],
-                SparseBatch::Entry::CmpValue);
-    }
-  }
+SimpleDMatrix::SimpleDMatrix(dmlc::Stream* in_stream) {
+  int tmagic;
+  CHECK(in_stream->Read(&tmagic, sizeof(tmagic)) == sizeof(tmagic))
+      << "invalid input file format";
+  CHECK_EQ(tmagic, kMagic) << "invalid format, magic number mismatch";
+  info.LoadBinary(in_stream);
+  in_stream->Read(&sparse_page_.offset.HostVector());
+  in_stream->Read(&sparse_page_.data.HostVector());
 }
 
-void SimpleDMatrix::MakeManyBatch(const std::vector<bool>& enabled,
-                                  float pkeep,
-                                  size_t max_row_perbatch) {
-  size_t btop = 0;
-  std::bernoulli_distribution coin_flip(pkeep);
-  auto& rnd = common::GlobalRandom();
-  buffered_rowset_.clear();
-  // internal temp cache
-  SparsePage tmp; tmp.Clear();
-  // start working
-  dmlc::DataIter<RowBatch>* iter = this->RowIterator();
-  iter->BeforeFirst();
-
-  while (iter->Next()) {
-    const RowBatch &batch = iter->Value();
-    for (size_t i = 0; i < batch.size; ++i) {
-      bst_uint ridx = static_cast<bst_uint>(batch.base_rowid + i);
-      if (pkeep == 1.0f || coin_flip(rnd)) {
-        buffered_rowset_.push_back(ridx);
-        tmp.Push(batch[i]);
-      }
-      if (tmp.Size() >= max_row_perbatch) {
-        std::unique_ptr<SparsePage> page(new SparsePage());
-        this->MakeColPage(tmp.GetRowBatch(0), btop, enabled, page.get());
-        col_iter_.cpages_.push_back(std::move(page));
-        btop = buffered_rowset_.size();
-        tmp.Clear();
-      }
-    }
-  }
-
-  if (tmp.Size() != 0) {
-    std::unique_ptr<SparsePage> page(new SparsePage());
-    this->MakeColPage(tmp.GetRowBatch(0), btop, enabled, page.get());
-    col_iter_.cpages_.push_back(std::move(page));
-  }
+void SimpleDMatrix::SaveToLocalFile(const std::string& fname) {
+    std::unique_ptr<dmlc::Stream> fo(dmlc::Stream::Create(fname.c_str(), "w"));
+    int tmagic = kMagic;
+    fo->Write(&tmagic, sizeof(tmagic));
+    info.SaveBinary(fo.get());
+    fo->Write(sparse_page_.offset.HostVector());
+    fo->Write(sparse_page_.data.HostVector());
 }
 
-// make column page from subset of rowbatchs
-void SimpleDMatrix::MakeColPage(const RowBatch& batch,
-                                size_t buffer_begin,
-                                const std::vector<bool>& enabled,
-                                SparsePage* pcol) {
-  const int nthread = std::min(omp_get_max_threads(), std::max(omp_get_num_procs() / 2 - 2, 1));
-  pcol->Clear();
-  common::ParallelGroupBuilder<SparseBatch::Entry>
-      builder(&pcol->offset, &pcol->data);
-  builder.InitBudget(info().num_col, nthread);
-  bst_omp_uint ndata = static_cast<bst_uint>(batch.size);
-  #pragma omp parallel for schedule(static) num_threads(nthread)
-  for (bst_omp_uint i = 0; i < ndata; ++i) {
-    int tid = omp_get_thread_num();
-    RowBatch::Inst inst = batch[i];
-    for (bst_uint j = 0; j < inst.length; ++j) {
-      const SparseBatch::Entry &e = inst[j];
-      if (enabled[e.index]) {
-        builder.AddBudget(e.index, tid);
-      }
-    }
-  }
-  builder.InitStorage();
-  #pragma omp parallel for schedule(static) num_threads(nthread)
-  for (bst_omp_uint i = 0; i < ndata; ++i) {
-    int tid = omp_get_thread_num();
-    RowBatch::Inst inst = batch[i];
-    for (bst_uint j = 0; j < inst.length; ++j) {
-      const SparseBatch::Entry &e = inst[j];
-      builder.Push(
-          e.index,
-          SparseBatch::Entry(buffered_rowset_[i + buffer_begin], e.fvalue),
-          tid);
-    }
-  }
-  CHECK_EQ(pcol->Size(), info().num_col);
-  // sort columns
-  bst_omp_uint ncol = static_cast<bst_omp_uint>(pcol->Size());
-  #pragma omp parallel for schedule(dynamic, 1) num_threads(nthread)
-  for (bst_omp_uint i = 0; i < ncol; ++i) {
-    if (pcol->offset[i] < pcol->offset[i + 1]) {
-      std::sort(dmlc::BeginPtr(pcol->data) + pcol->offset[i],
-                dmlc::BeginPtr(pcol->data) + pcol->offset[i + 1],
-                SparseBatch::Entry::CmpValue);
-    }
-  }
-}
-
-bool SimpleDMatrix::SingleColBlock() const {
-  return col_iter_.cpages_.size() <= 1;
-}
+template SimpleDMatrix::SimpleDMatrix(DenseAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(CSRAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(CSCAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(DataTableAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(FileAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(DMatrixSliceAdapter* adapter, float missing,
+                                     int nthread);
+template SimpleDMatrix::SimpleDMatrix(IteratorAdapter* adapter, float missing,
+                                     int nthread);
 }  // namespace data
 }  // namespace xgboost

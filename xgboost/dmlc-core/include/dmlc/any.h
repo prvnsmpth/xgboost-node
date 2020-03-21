@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <utility>
 #include <algorithm>
+#include <cstring>
 
 #include "./base.h"
 #include "./logging.h"
@@ -20,7 +21,7 @@ namespace dmlc {
 class any;
 
 /*!
- * Get a  reference to content stored in the any as type T.
+ * Get a reference to content stored in the any as type T.
  * This will cause an error if
  * T does not match the type stored.
  * This function is not part of std::any standard.
@@ -44,6 +45,32 @@ inline T& get(any& src);  // NOLINT(*)
  */
 template<typename T>
 inline const T& get(const any& src);
+
+/*!
+ * The "unsafe" versions of get. It is required when where we know
+ * what type is stored in the any and can't use typeid() comparison,
+ * e.g., when our types may travel across different shared libraries.
+ * This function is not part of std::any standard.
+ *
+ * \param src The source source any container.
+ * \return The reference of content
+ * \tparam T The type of the value to be fetched.
+ */
+template<typename T>
+inline const T& unsafe_get(const any& src);
+
+/*!
+ * The "unsafe" versions of get. It is required when where we know
+ * what type is stored in the any and can't use typeid() comparison,
+ * e.g., when our types may travel across different shared libraries.
+ * This function is not part of std::any standard.
+ *
+ * \param src The source source any container.
+ * \return The reference of content
+ * \tparam T The type of the value to be fetched.
+ */
+template<typename T>
+inline T& unsafe_get(any& src);  // NOLINT(*)
 
 /*!
  * \brief An any class that is compatible to std::any in c++17.
@@ -108,7 +135,7 @@ class any {
    */
   inline bool empty() const;
   /*!
-   * \return clear the content of container
+   * \brief clear the content of container
    */
   inline void clear();
   /*!
@@ -120,6 +147,9 @@ class any {
    * \return The type_info about the stored type.
    */
   inline const std::type_info& type() const;
+  /*! \brief Construct value of type T inplace */
+  template<typename T, typename... Args>
+  inline void construct(Args&&... args);
 
  private:
   //! \cond Doxygen_Suppress
@@ -159,6 +189,10 @@ class any {
   friend T& get(any& src);  // NOLINT(*)
   template<typename T>
   friend const T& get(const any& src);
+  template<typename T>
+  friend T& unsafe_get(any& src);  // NOLINT(*)
+  template<typename T>
+  friend const T& unsafe_get(const any& src);
   // internal construct function
   inline void construct(any&& other);
   // internal construct function
@@ -166,6 +200,8 @@ class any {
   // internal function to check if type is correct.
   template<typename T>
   inline void check_type() const;
+  template<typename T>
+  inline void check_type_by_name() const;
   // internal type specific information
   const Type* type_{nullptr};
   // internal data
@@ -182,7 +218,12 @@ inline any::any(T&& other) {
                   "Any can only hold value that is copy constructable");
     type_ = TypeInfo<DT>::get_type();
     if (data_on_stack<DT>::value) {
+#pragma GCC diagnostic push
+#if 6 <= __GNUC__
+#pragma GCC diagnostic ignored "-Wplacement-new"
+#endif
       new (&(data_.stack)) DT(std::forward<T>(other));
+#pragma GCC diagnostic pop
     } else {
       data_.pheap = new DT(std::forward<T>(other));
     }
@@ -207,6 +248,23 @@ inline void any::construct(const any& other) {
   type_ = other.type_;
   if (type_ != nullptr) {
     type_->create_from_data(&data_, other.data_);
+  }
+}
+
+template<typename T, typename... Args>
+inline void any::construct(Args&&... args) {
+  clear();
+  typedef typename std::decay<T>::type DT;
+  type_ = TypeInfo<DT>::get_type();
+  if (data_on_stack<DT>::value) {
+#pragma GCC diagnostic push
+#if 6 <= __GNUC__
+#pragma GCC diagnostic ignored "-Wplacement-new"
+#endif
+    new (&(data_.stack)) DT(std::forward<Args>(args)...);
+#pragma GCC diagnostic pop
+  } else {
+    data_.pheap = new DT(std::forward<Args>(args)...);
   }
 }
 
@@ -261,8 +319,19 @@ inline void any::check_type() const {
   CHECK(type_ != nullptr)
       << "The any container is empty"
       << " requested=" << typeid(T).name();
-  CHECK(type_->ptype_info == &typeid(T))
+  CHECK(*(type_->ptype_info) == typeid(T))
       << "The stored type mismatch"
+      << " stored=" << type_->ptype_info->name()
+      << " requested=" << typeid(T).name();
+}
+
+template<typename T>
+inline void any::check_type_by_name() const {
+  CHECK(type_ != nullptr)
+      << "The any container is empty"
+      << " requested=" << typeid(T).name();
+  CHECK(strcmp(type_->ptype_info->name(), typeid(T).name()) == 0)
+      << "The stored type name mismatch"
       << " stored=" << type_->ptype_info->name()
       << " requested=" << typeid(T).name();
 }
@@ -276,6 +345,18 @@ inline const T& get(const any& src) {
 template<typename T>
 inline T& get(any& src) { // NOLINT(*)
   src.check_type<T>();
+  return *any::TypeInfo<T>::get_ptr(&(src.data_));
+}
+
+template<typename T>
+inline const T& unsafe_get(const any& src) {
+  src.check_type_by_name<T>();
+  return *any::TypeInfo<T>::get_ptr(&(src.data_));
+}
+
+template<typename T>
+inline T& unsafe_get(any& src) { // NOLINT(*)
+  src.check_type_by_name<T>();
   return *any::TypeInfo<T>::get_ptr(&(src.data_));
 }
 
@@ -330,7 +411,7 @@ class any::TypeInfo
   Type type_;
   // constructor
   TypeInfo() {
-    if (std::is_pod<T>::value) {
+    if (std::is_pod<T>::value && data_on_stack<T>::value) {
       type_.destroy = nullptr;
     } else {
       type_.destroy = TypeInfo<T>::destroy;

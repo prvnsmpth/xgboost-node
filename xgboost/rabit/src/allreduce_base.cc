@@ -8,12 +8,17 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_DEPRECATE
 #define NOMINMAX
-#include <map>
-#include <cstdlib>
+#include <netinet/tcp.h>
 #include <cstring>
-#include "./allreduce_base.h"
+#include <map>
+#include "allreduce_base.h"
 
 namespace rabit {
+
+namespace utils {
+  bool STOP_PROCESS_ON_ERROR = true;
+}
+
 namespace engine {
 // constructor
 AllreduceBase::AllreduceBase(void) {
@@ -34,24 +39,19 @@ AllreduceBase::AllreduceBase(void) {
   err_link = NULL;
   dmlc_role = "worker";
   this->SetParam("rabit_reduce_buffer", "256MB");
-  // setup possible enviroment variable of intrest
-  env_vars.push_back("rabit_task_id");
-  env_vars.push_back("rabit_num_trial");
-  env_vars.push_back("rabit_reduce_buffer");
-  env_vars.push_back("rabit_reduce_ring_mincount");
-  env_vars.push_back("rabit_tracker_uri");
-  env_vars.push_back("rabit_tracker_port");
-  // also include dmlc support direct variables
+  // setup possible enviroment variable of interest
+  // include dmlc support direct variables
   env_vars.push_back("DMLC_TASK_ID");
   env_vars.push_back("DMLC_ROLE");
   env_vars.push_back("DMLC_NUM_ATTEMPT");
   env_vars.push_back("DMLC_TRACKER_URI");
   env_vars.push_back("DMLC_TRACKER_PORT");
   env_vars.push_back("DMLC_WORKER_CONNECT_RETRY");
+  env_vars.push_back("DMLC_WORKER_STOP_PROCESS_ON_ERROR");
 }
 
 // initialization function
-void AllreduceBase::Init(int argc, char* argv[]) {
+bool AllreduceBase::Init(int argc, char* argv[]) {
   // setup from enviroment variables
   // handler to get variables from env
   for (size_t i = 0; i < env_vars.size(); ++i) {
@@ -74,7 +74,7 @@ void AllreduceBase::Init(int argc, char* argv[]) {
     if (task_id == NULL) {
       task_id = getenv("mapreduce_task_id");
     }
-    if (hadoop_mode != 0) {
+    if (hadoop_mode) {
       utils::Check(task_id != NULL,
                    "hadoop_mode is set but cannot find mapred_task_id");
     }
@@ -95,7 +95,7 @@ void AllreduceBase::Init(int argc, char* argv[]) {
     if (num_task == NULL) {
       num_task = getenv("mapreduce_job_maps");
     }
-    if (hadoop_mode != 0) {
+    if (hadoop_mode) {
       utils::Check(num_task != NULL,
                    "hadoop_mode is set but cannot find mapred_map_tasks");
     }
@@ -108,6 +108,7 @@ void AllreduceBase::Init(int argc, char* argv[]) {
             ", quit this program by exit 0\n");
     exit(0);
   }
+
   // clear the setting before start reconnection
   this->rank = -1;
   //---------------------
@@ -116,23 +117,30 @@ void AllreduceBase::Init(int argc, char* argv[]) {
   utils::Assert(all_links.size() == 0, "can only call Init once");
   this->host_uri = utils::SockAddr::GetHostName();
   // get information from tracker
-  this->ReConnectLinks();
+  return this->ReConnectLinks();
 }
 
-void AllreduceBase::Shutdown(void) {
-  for (size_t i = 0; i < all_links.size(); ++i) {
-    all_links[i].sock.Close();
+bool AllreduceBase::Shutdown(void) {
+  try {
+    for (size_t i = 0; i < all_links.size(); ++i) {
+      all_links[i].sock.Close();
+    }
+    all_links.clear();
+    tree_links.plinks.clear();
+
+    if (tracker_uri == "NULL") return true;
+    // notify tracker rank i have shutdown
+    utils::TCPSocket tracker = this->ConnectTracker();
+    tracker.SendStr(std::string("shutdown"));
+    tracker.Close();
+    utils::TCPSocket::Finalize();
+    return true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "failed to shutdown due to %s\n", e.what());
+    return false;
   }
-  all_links.clear();
-  tree_links.plinks.clear();
-
-  if (tracker_uri == "NULL") return;
-  // notify tracker rank i have shutdown
-  utils::TCPSocket tracker = this->ConnectTracker();
-  tracker.SendStr(std::string("shutdown"));
-  tracker.Close();
-  utils::TCPSocket::Finalize();
 }
+
 void AllreduceBase::TrackerPrint(const std::string &msg) {
   if (tracker_uri == "NULL") {
     utils::Printf("%s", msg.c_str()); return;
@@ -142,6 +150,7 @@ void AllreduceBase::TrackerPrint(const std::string &msg) {
   tracker.SendStr(msg);
   tracker.Close();
 }
+
 // util to parse data with unit suffix
 inline size_t ParseUnit(const char *name, const char *val) {
   char unit;
@@ -178,15 +187,44 @@ void AllreduceBase::SetParam(const char *name, const char *val) {
   if (!strcmp(name, "DMLC_TASK_ID")) task_id = val;
   if (!strcmp(name, "DMLC_ROLE")) dmlc_role = val;
   if (!strcmp(name, "rabit_world_size")) world_size = atoi(val);
-  if (!strcmp(name, "rabit_hadoop_mode")) hadoop_mode = atoi(val);
+  if (!strcmp(name, "rabit_hadoop_mode")) hadoop_mode = utils::StringToBool(val);
   if (!strcmp(name, "rabit_reduce_ring_mincount")) {
-    reduce_ring_mincount = ParseUnit(name, val);
+    reduce_ring_mincount = atoi(val);
+    utils::Assert(reduce_ring_mincount > 0, "rabit_reduce_ring_mincount should be greater than 0");
   }
   if (!strcmp(name, "rabit_reduce_buffer")) {
     reduce_buffer_size = (ParseUnit(name, val) + 7) >> 3;
   }
   if (!strcmp(name, "DMLC_WORKER_CONNECT_RETRY")) {
     connect_retry = atoi(val);
+  }
+  if (!strcmp(name, "DMLC_WORKER_STOP_PROCESS_ON_ERROR")) {
+    if (!strcmp(val, "true")) {
+      rabit::utils::STOP_PROCESS_ON_ERROR = true;
+    } else if (!strcmp(val, "false")) {
+      rabit::utils::STOP_PROCESS_ON_ERROR = false;
+    } else {
+      throw std::runtime_error("invalid value of DMLC_WORKER_STOP_PROCESS_ON_ERROR");
+    }
+  }
+  if (!strcmp(name, "rabit_bootstrap_cache")) {
+    rabit_bootstrap_cache = utils::StringToBool(val);
+  }
+  if (!strcmp(name, "rabit_debug")) {
+    rabit_debug = utils::StringToBool(val);
+  }
+  if (!strcmp(name, "rabit_timeout")) {
+    rabit_timeout = utils::StringToBool(val);
+  }
+  if (!strcmp(name, "rabit_timeout_sec")) {
+    timeout_sec = atoi(val);
+    utils::Assert(timeout_sec >= 0, "rabit_timeout_sec should be non negative second");
+  }
+  if (!strcmp(name, "rabit_enable_tcp_no_delay")) {
+    if (!strcmp(val, "true"))
+      rabit_enable_tcp_no_delay = true;
+    else
+      rabit_enable_tcp_no_delay = false;
   }
 }
 /*!
@@ -207,11 +245,11 @@ utils::TCPSocket AllreduceBase::ConnectTracker(void) const {
         utils::Socket::Error("Connect");
       } else {
         fprintf(stderr, "retry connect to ip(retry time %d): [%s]\n", retry, tracker_uri.c_str());
-        #ifdef _MSC_VER
-        Sleep(1);
-        #else
-        sleep(1);
-        #endif
+#if defined(_MSC_VER) || defined (__MINGW32__)
+        Sleep(retry << 1);
+#else
+        sleep(retry << 1);
+#endif
         continue;
       }
     }
@@ -235,153 +273,181 @@ utils::TCPSocket AllreduceBase::ConnectTracker(void) const {
  * \brief connect to the tracker to fix the the missing links
  *   this function is also used when the engine start up
  */
-void AllreduceBase::ReConnectLinks(const char *cmd) {
+bool AllreduceBase::ReConnectLinks(const char *cmd) {
   // single node mode
   if (tracker_uri == "NULL") {
-    rank = 0; world_size = 1; return;
+    rank = 0; world_size = 1; return true;
   }
-  utils::TCPSocket tracker = this->ConnectTracker();
-  tracker.SendStr(std::string(cmd));
+  try {
+    utils::TCPSocket tracker = this->ConnectTracker();
+    fprintf(stdout, "task %s connected to the tracker\n", task_id.c_str());
+    tracker.SendStr(std::string(cmd));
 
-  // the rank of previous link, next link in ring
-  int prev_rank, next_rank;
-  // the rank of neighbors
-  std::map<int, int> tree_neighbors;
-  using utils::Assert;
-  // get new ranks
-  int newrank, num_neighbors;
-  Assert(tracker.RecvAll(&newrank, sizeof(newrank)) == sizeof(newrank),
+    // the rank of previous link, next link in ring
+    int prev_rank, next_rank;
+    // the rank of neighbors
+    std::map<int, int> tree_neighbors;
+    using utils::Assert;
+    // get new ranks
+    int newrank, num_neighbors;
+    Assert(tracker.RecvAll(&newrank, sizeof(newrank)) == sizeof(newrank),
            "ReConnectLink failure 4");
-  Assert(tracker.RecvAll(&parent_rank, sizeof(parent_rank)) ==\
+    Assert(tracker.RecvAll(&parent_rank, sizeof(parent_rank)) == \
          sizeof(parent_rank), "ReConnectLink failure 4");
-  Assert(tracker.RecvAll(&world_size, sizeof(world_size)) == sizeof(world_size),
-         "ReConnectLink failure 4");
-  Assert(rank == -1 || newrank == rank,
-         "must keep rank to same if the node already have one");
-  rank = newrank;
-  Assert(tracker.RecvAll(&num_neighbors, sizeof(num_neighbors)) ==  \
-         sizeof(num_neighbors), "ReConnectLink failure 4");
-  for (int i = 0; i < num_neighbors; ++i) {
-    int nrank;
-    Assert(tracker.RecvAll(&nrank, sizeof(nrank)) == sizeof(nrank),
+    Assert(tracker.RecvAll(&world_size, sizeof(world_size)) == sizeof(world_size),
            "ReConnectLink failure 4");
-    tree_neighbors[nrank] = 1;
-  }
-  Assert(tracker.RecvAll(&prev_rank, sizeof(prev_rank)) == sizeof(prev_rank),
-         "ReConnectLink failure 4");
-  Assert(tracker.RecvAll(&next_rank, sizeof(next_rank)) == sizeof(next_rank),
-         "ReConnectLink failure 4");
-  // create listening socket
-  utils::TCPSocket sock_listen;
-  sock_listen.Create();
-  int port = sock_listen.TryBindHost(slave_port, slave_port + nport_trial);
-  utils::Check(port != -1, "ReConnectLink fail to bind the ports specified");
-  sock_listen.Listen();
+    Assert(rank == -1 || newrank == rank,
+           "must keep rank to same if the node already have one");
+    rank = newrank;
 
-  // get number of to connect and number of to accept nodes from tracker
-  int num_conn, num_accept, num_error = 1;
-  do {
-    // send over good links
-    std::vector<int> good_link;
-    for (size_t i = 0; i < all_links.size(); ++i) {
-      if (!all_links[i].sock.BadSocket()) {
-        good_link.push_back(static_cast<int>(all_links[i].rank));
-      } else {
-        if (!all_links[i].sock.IsClosed()) all_links[i].sock.Close();
-      }
+    // tracker got overwhelemed and not able to assign correct rank
+    if (rank == -1) exit(-1);
+
+    fprintf(stdout, "task %s got new rank %d\n", task_id.c_str(), rank);
+
+    Assert(tracker.RecvAll(&num_neighbors, sizeof(num_neighbors)) == \
+         sizeof(num_neighbors), "ReConnectLink failure 4");
+    for (int i = 0; i < num_neighbors; ++i) {
+      int nrank;
+      Assert(tracker.RecvAll(&nrank, sizeof(nrank)) == sizeof(nrank),
+             "ReConnectLink failure 4");
+      tree_neighbors[nrank] = 1;
     }
-    int ngood = static_cast<int>(good_link.size());
-    Assert(tracker.SendAll(&ngood, sizeof(ngood)) == sizeof(ngood),
-           "ReConnectLink failure 5");
-    for (size_t i = 0; i < good_link.size(); ++i) {
-      Assert(tracker.SendAll(&good_link[i], sizeof(good_link[i])) == \
+    Assert(tracker.RecvAll(&prev_rank, sizeof(prev_rank)) == sizeof(prev_rank),
+           "ReConnectLink failure 4");
+    Assert(tracker.RecvAll(&next_rank, sizeof(next_rank)) == sizeof(next_rank),
+           "ReConnectLink failure 4");
+
+    utils::TCPSocket sock_listen;
+    if (!sock_listen.IsClosed()) {
+      sock_listen.Close();
+    }
+    // create listening socket
+    sock_listen.Create();
+    int port = sock_listen.TryBindHost(slave_port, slave_port + nport_trial);
+    utils::Check(port != -1, "ReConnectLink fail to bind the ports specified");
+    sock_listen.Listen();
+
+    // get number of to connect and number of to accept nodes from tracker
+    int num_conn, num_accept, num_error = 1;
+    do {
+      // send over good links
+      std::vector<int> good_link;
+      for (size_t i = 0; i < all_links.size(); ++i) {
+        if (!all_links[i].sock.BadSocket()) {
+          good_link.push_back(static_cast<int>(all_links[i].rank));
+        } else {
+          if (!all_links[i].sock.IsClosed()) all_links[i].sock.Close();
+        }
+      }
+      int ngood = static_cast<int>(good_link.size());
+      Assert(tracker.SendAll(&ngood, sizeof(ngood)) == sizeof(ngood),
+             "ReConnectLink failure 5");
+      for (size_t i = 0; i < good_link.size(); ++i) {
+        Assert(tracker.SendAll(&good_link[i], sizeof(good_link[i])) == \
              sizeof(good_link[i]), "ReConnectLink failure 6");
-    }
-    Assert(tracker.RecvAll(&num_conn, sizeof(num_conn)) == sizeof(num_conn),
-           "ReConnectLink failure 7");
-    Assert(tracker.RecvAll(&num_accept, sizeof(num_accept)) ==  \
-           sizeof(num_accept), "ReConnectLink failure 8");
-    num_error = 0;
-    for (int i = 0; i < num_conn; ++i) {
-      LinkRecord r;
-      int hport, hrank;
-      std::string hname;
-      tracker.RecvStr(&hname);
-      Assert(tracker.RecvAll(&hport, sizeof(hport)) == sizeof(hport),
-             "ReConnectLink failure 9");
-      Assert(tracker.RecvAll(&hrank, sizeof(hrank)) == sizeof(hrank),
-             "ReConnectLink failure 10");
-      r.sock.Create();
-      if (!r.sock.Connect(utils::SockAddr(hname.c_str(), hport))) {
-        num_error += 1; r.sock.Close(); continue;
       }
+      Assert(tracker.RecvAll(&num_conn, sizeof(num_conn)) == sizeof(num_conn),
+             "ReConnectLink failure 7");
+      Assert(tracker.RecvAll(&num_accept, sizeof(num_accept)) == \
+           sizeof(num_accept), "ReConnectLink failure 8");
+      num_error = 0;
+      for (int i = 0; i < num_conn; ++i) {
+        LinkRecord r;
+        int hport, hrank;
+        std::string hname;
+        tracker.RecvStr(&hname);
+        Assert(tracker.RecvAll(&hport, sizeof(hport)) == sizeof(hport),
+               "ReConnectLink failure 9");
+        Assert(tracker.RecvAll(&hrank, sizeof(hrank)) == sizeof(hrank),
+               "ReConnectLink failure 10");
+
+        r.sock.Create();
+        if (!r.sock.Connect(utils::SockAddr(hname.c_str(), hport))) {
+          num_error += 1;
+          r.sock.Close();
+          continue;
+        }
+        Assert(r.sock.SendAll(&rank, sizeof(rank)) == sizeof(rank),
+               "ReConnectLink failure 12");
+        Assert(r.sock.RecvAll(&r.rank, sizeof(r.rank)) == sizeof(r.rank),
+               "ReConnectLink failure 13");
+        utils::Check(hrank == r.rank,
+                     "ReConnectLink failure, link rank inconsistent");
+        bool match = false;
+        for (size_t i = 0; i < all_links.size(); ++i) {
+          if (all_links[i].rank == hrank) {
+            Assert(all_links[i].sock.IsClosed(),
+                   "Override a link that is active");
+            all_links[i].sock = r.sock;
+            match = true;
+            break;
+          }
+        }
+        if (!match) all_links.push_back(r);
+      }
+      Assert(tracker.SendAll(&num_error, sizeof(num_error)) == sizeof(num_error),
+             "ReConnectLink failure 14");
+    } while (num_error != 0);
+    // send back socket listening port to tracker
+    Assert(tracker.SendAll(&port, sizeof(port)) == sizeof(port),
+           "ReConnectLink failure 14");
+    // close connection to tracker
+    tracker.Close();
+    // listen to incoming links
+    for (int i = 0; i < num_accept; ++i) {
+      LinkRecord r;
+      r.sock = sock_listen.Accept();
       Assert(r.sock.SendAll(&rank, sizeof(rank)) == sizeof(rank),
-             "ReConnectLink failure 12");
+             "ReConnectLink failure 15");
       Assert(r.sock.RecvAll(&r.rank, sizeof(r.rank)) == sizeof(r.rank),
-             "ReConnectLink failure 13");
-      utils::Check(hrank == r.rank,
-                   "ReConnectLink failure, link rank inconsistent");
+             "ReConnectLink failure 15");
       bool match = false;
       for (size_t i = 0; i < all_links.size(); ++i) {
-        if (all_links[i].rank == hrank) {
-          Assert(all_links[i].sock.IsClosed(),
-                 "Override a link that is active");
-          all_links[i].sock = r.sock; match = true; break;
+        if (all_links[i].rank == r.rank) {
+          utils::Assert(all_links[i].sock.IsClosed(),
+                        "Override a link that is active");
+          all_links[i].sock = r.sock;
+          match = true;
+          break;
         }
       }
       if (!match) all_links.push_back(r);
     }
-    Assert(tracker.SendAll(&num_error, sizeof(num_error)) == sizeof(num_error),
-           "ReConnectLink failure 14");
-  } while (num_error != 0);
-  // send back socket listening port to tracker
-  Assert(tracker.SendAll(&port, sizeof(port)) == sizeof(port),
-         "ReConnectLink failure 14");
-  // close connection to tracker
-  tracker.Close();
-  // listen to incoming links
-  for (int i = 0; i < num_accept; ++i) {
-    LinkRecord r;
-    r.sock = sock_listen.Accept();
-    Assert(r.sock.SendAll(&rank, sizeof(rank)) == sizeof(rank),
-           "ReConnectLink failure 15");
-    Assert(r.sock.RecvAll(&r.rank, sizeof(r.rank)) == sizeof(r.rank),
-           "ReConnectLink failure 15");
-    bool match = false;
+    sock_listen.Close();
+    this->parent_index = -1;
+    // setup tree links and ring structure
+    tree_links.plinks.clear();
+    int tcpNoDelay = 1;
     for (size_t i = 0; i < all_links.size(); ++i) {
-      if (all_links[i].rank == r.rank) {
-        utils::Assert(all_links[i].sock.IsClosed(),
-                      "Override a link that is active");
-        all_links[i].sock = r.sock; match = true; break;
+      utils::Assert(!all_links[i].sock.BadSocket(), "ReConnectLink: bad socket");
+      // set the socket to non-blocking mode, enable TCP keepalive
+      all_links[i].sock.SetNonBlock(true);
+      all_links[i].sock.SetKeepAlive(true);
+      if (rabit_enable_tcp_no_delay) {
+        setsockopt(all_links[i].sock, IPPROTO_TCP,
+                   TCP_NODELAY, reinterpret_cast<void *>(&tcpNoDelay), sizeof(tcpNoDelay));
       }
-    }
-    if (!match) all_links.push_back(r);
-  }
-  // close listening sockets
-  sock_listen.Close();
-  this->parent_index = -1;
-  // setup tree links and ring structure
-  tree_links.plinks.clear();
-  for (size_t i = 0; i < all_links.size(); ++i) {
-    utils::Assert(!all_links[i].sock.BadSocket(), "ReConnectLink: bad socket");
-    // set the socket to non-blocking mode, enable TCP keepalive
-    all_links[i].sock.SetNonBlock(true);
-    all_links[i].sock.SetKeepAlive(true);
-    if (tree_neighbors.count(all_links[i].rank) != 0) {
-      if (all_links[i].rank == parent_rank) {
-        parent_index = static_cast<int>(tree_links.plinks.size());
+      if (tree_neighbors.count(all_links[i].rank) != 0) {
+        if (all_links[i].rank == parent_rank) {
+          parent_index = static_cast<int>(tree_links.plinks.size());
+        }
+        tree_links.plinks.push_back(&all_links[i]);
       }
-      tree_links.plinks.push_back(&all_links[i]);
+      if (all_links[i].rank == prev_rank) ring_prev = &all_links[i];
+      if (all_links[i].rank == next_rank) ring_next = &all_links[i];
     }
-    if (all_links[i].rank == prev_rank) ring_prev = &all_links[i];
-    if (all_links[i].rank == next_rank) ring_next = &all_links[i];
+    Assert(parent_rank == -1 || parent_index != -1,
+           "cannot find parent in the link");
+    Assert(prev_rank == -1 || ring_prev != NULL,
+           "cannot find prev ring in the link");
+    Assert(next_rank == -1 || ring_next != NULL,
+           "cannot find next ring in the link");
+    return true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "failed in ReconnectLink %s\n", e.what());
+    return false;
   }
-  Assert(parent_rank == -1 || parent_index != -1,
-         "cannot find parent in the link");
-  Assert(prev_rank == -1 || ring_prev != NULL,
-         "cannot find prev ring in the link");
-  Assert(next_rank == -1 || ring_next != NULL,
-         "cannot find next ring in the link");
 }
 /*!
  * \brief perform in-place allreduce, on sendrecvbuf, this function can fail, and will return the cause of failure
@@ -454,29 +520,29 @@ AllreduceBase::TryAllreduceTree(void *sendrecvbuf_,
   while (true) {
     // select helper
     bool finished = true;
-    utils::SelectHelper selecter;
+    utils::PollHelper watcher;
     for (int i = 0; i < nlink; ++i) {
       if (i == parent_index) {
         if (size_down_in != total_size) {
-          selecter.WatchRead(links[i].sock);
+          watcher.WatchRead(links[i].sock);
           // only watch for exception in live channels
-          selecter.WatchException(links[i].sock);
+          watcher.WatchException(links[i].sock);
           finished = false;
         }
         if (size_up_out != total_size && size_up_out < size_up_reduce) {
-          selecter.WatchWrite(links[i].sock);
+          watcher.WatchWrite(links[i].sock);
         }
       } else {
         if (links[i].size_read != total_size) {
-          selecter.WatchRead(links[i].sock);
+          watcher.WatchRead(links[i].sock);
         }
         // size_write <= size_read
         if (links[i].size_write != total_size) {
           if (links[i].size_write < size_down_in) {
-            selecter.WatchWrite(links[i].sock);
+            watcher.WatchWrite(links[i].sock);
           }
           // only watch for exception in live channels
-          selecter.WatchException(links[i].sock);
+          watcher.WatchException(links[i].sock);
           finished = false;
         }
       }
@@ -484,17 +550,17 @@ AllreduceBase::TryAllreduceTree(void *sendrecvbuf_,
     // finish runing allreduce
     if (finished) break;
     // select must return
-    selecter.Select();
+    watcher.Poll();
     // exception handling
     for (int i = 0; i < nlink; ++i) {
       // recive OOB message from some link
-      if (selecter.CheckExcept(links[i].sock)) {
+      if (watcher.CheckExcept(links[i].sock)) {
         return ReportError(&links[i], kGetExcept);
       }
     }
     // read data from childs
     for (int i = 0; i < nlink; ++i) {
-      if (i != parent_index && selecter.CheckRead(links[i].sock)) {
+      if (i != parent_index && watcher.CheckRead(links[i].sock)) {
         ReturnType ret = links[i].ReadToRingBuffer(size_up_out, total_size);
         if (ret != kSuccess) {
           return ReportError(&links[i], ret);
@@ -551,7 +617,7 @@ AllreduceBase::TryAllreduceTree(void *sendrecvbuf_,
         }
       }
       // read data from parent
-      if (selecter.CheckRead(links[parent_index].sock) &&
+      if (watcher.CheckRead(links[parent_index].sock) &&
           total_size > size_down_in) {
         ssize_t len = links[parent_index].sock.
             Recv(sendrecvbuf + size_down_in, total_size - size_down_in);
@@ -620,37 +686,37 @@ AllreduceBase::TryBroadcast(void *sendrecvbuf_, size_t total_size, int root) {
   while (true) {
     bool finished = true;
     // select helper
-    utils::SelectHelper selecter;
+    utils::PollHelper watcher;
     for (int i = 0; i < nlink; ++i) {
       if (in_link == -2) {
-        selecter.WatchRead(links[i].sock); finished = false;
+        watcher.WatchRead(links[i].sock); finished = false;
       }
       if (i == in_link && links[i].size_read != total_size) {
-        selecter.WatchRead(links[i].sock); finished = false;
+        watcher.WatchRead(links[i].sock); finished = false;
       }
       if (in_link != -2 && i != in_link && links[i].size_write != total_size) {
         if (links[i].size_write < size_in) {
-          selecter.WatchWrite(links[i].sock);
+          watcher.WatchWrite(links[i].sock);
         }
         finished = false;
       }
-      selecter.WatchException(links[i].sock);
+      watcher.WatchException(links[i].sock);
     }
     // finish running
     if (finished) break;
     // select
-    selecter.Select();
+    watcher.Poll();
     // exception handling
     for (int i = 0; i < nlink; ++i) {
       // recive OOB message from some link
-      if (selecter.CheckExcept(links[i].sock)) {
+      if (watcher.CheckExcept(links[i].sock)) {
         return ReportError(&links[i], kGetExcept);
       }
     }
     if (in_link == -2) {
       // probe in-link
       for (int i = 0; i < nlink; ++i) {
-        if (selecter.CheckRead(links[i].sock)) {
+        if (watcher.CheckRead(links[i].sock)) {
           ReturnType ret = links[i].ReadToArray(sendrecvbuf_, total_size);
           if (ret != kSuccess) {
             return ReportError(&links[i], ret);
@@ -663,7 +729,7 @@ AllreduceBase::TryBroadcast(void *sendrecvbuf_, size_t total_size, int root) {
       }
     } else {
       // read from in link
-      if (in_link >= 0 && selecter.CheckRead(links[in_link].sock)) {
+      if (in_link >= 0 && watcher.CheckRead(links[in_link].sock)) {
         ReturnType ret = links[in_link].ReadToArray(sendrecvbuf_, total_size);
         if (ret != kSuccess) {
           return ReportError(&links[in_link], ret);
@@ -717,20 +783,20 @@ AllreduceBase::TryAllgatherRing(void *sendrecvbuf_, size_t total_size,
   while (true) {
     // select helper
     bool finished = true;
-    utils::SelectHelper selecter;
+    utils::PollHelper watcher;
     if (read_ptr != stop_read) {
-      selecter.WatchRead(next.sock);
+      watcher.WatchRead(next.sock);
       finished = false;
     }
     if (write_ptr != stop_write) {
       if (write_ptr < read_ptr) {
-        selecter.WatchWrite(prev.sock);
+        watcher.WatchWrite(prev.sock);
       }
       finished  = false;
     }
     if (finished) break;
-    selecter.Select();
-    if (read_ptr != stop_read && selecter.CheckRead(next.sock)) {
+    watcher.Poll();
+    if (read_ptr != stop_read && watcher.CheckRead(next.sock)) {
       size_t size = stop_read - read_ptr;
       size_t start = read_ptr % total_size;
       if (start + size > total_size) {
@@ -811,20 +877,20 @@ AllreduceBase::TryReduceScatterRing(void *sendrecvbuf_,
   while (true) {
     // select helper
     bool finished = true;
-    utils::SelectHelper selecter;
+    utils::PollHelper watcher;
     if (read_ptr != stop_read) {
-      selecter.WatchRead(next.sock);
+      watcher.WatchRead(next.sock);
       finished = false;
     }
     if (write_ptr != stop_write) {
       if (write_ptr < reduce_ptr) {
-        selecter.WatchWrite(prev.sock);
+        watcher.WatchWrite(prev.sock);
       }
       finished = false;
     }
     if (finished) break;
-    selecter.Select();
-    if (read_ptr != stop_read && selecter.CheckRead(next.sock)) {
+    watcher.Poll();
+    if (read_ptr != stop_read && watcher.CheckRead(next.sock)) {
       ReturnType ret = next.ReadToRingBuffer(reduce_ptr, stop_read);
       if (ret != kSuccess) {
         return ReportError(&next, ret);

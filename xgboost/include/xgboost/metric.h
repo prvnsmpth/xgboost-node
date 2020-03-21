@@ -8,11 +8,15 @@
 #define XGBOOST_METRIC_H_
 
 #include <dmlc/registry.h>
+#include <xgboost/generic_parameters.h>
+#include <xgboost/data.h>
+#include <xgboost/base.h>
+#include <xgboost/host_device_vector.h>
+
 #include <vector>
 #include <string>
 #include <functional>
-#include "./data.h"
-#include "./base.h"
+#include <utility>
 
 namespace xgboost {
 /*!
@@ -20,7 +24,16 @@ namespace xgboost {
  *  This has nothing to do with training, but merely act as evaluation purpose.
  */
 class Metric {
+ protected:
+  GenericParameter const* tparam_;
+
  public:
+  /*!
+   * \brief Configure the Metric with the specified parameters.
+   * \param args arguments to the objective function.
+   */
+  virtual void Configure(
+      const std::vector<std::pair<std::string, std::string> >& args) {}
   /*!
    * \brief evaluate a specific metric
    * \param preds prediction
@@ -29,21 +42,22 @@ class Metric {
    *        the average statistics across all the node,
    *        this is only supported by some metrics
    */
-  virtual bst_float Eval(const std::vector<bst_float>& preds,
+  virtual bst_float Eval(const HostDeviceVector<bst_float>& preds,
                          const MetaInfo& info,
-                         bool distributed) const = 0;
+                         bool distributed) = 0;
   /*! \return name of metric */
   virtual const char* Name() const = 0;
   /*! \brief virtual destructor */
-  virtual ~Metric() {}
+  virtual ~Metric() = default;
   /*!
    * \brief create a metric according to name.
    * \param name name of the metric.
-   *  name can be in form metric[@]param
-   *  and the name will be matched in the registry.
+   *        name can be in form metric[@]param and the name will be matched in the
+   *        registry.
+   * \param tparam A global generic parameter
    * \return the created metric.
    */
-  static Metric* Create(const std::string& name);
+  static Metric* Create(const std::string& name, GenericParameter const* tparam);
 };
 
 /*!

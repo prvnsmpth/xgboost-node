@@ -1,5 +1,5 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014-2019 by Contributors
  * \file objective.h
  * \brief interface of objective function used by xgboost.
  * \author Tianqi Chen, Kailong Chen
@@ -8,27 +8,27 @@
 #define XGBOOST_OBJECTIVE_H_
 
 #include <dmlc/registry.h>
+#include <xgboost/base.h>
+#include <xgboost/data.h>
+#include <xgboost/model.h>
+#include <xgboost/generic_parameters.h>
+#include <xgboost/host_device_vector.h>
+
 #include <vector>
 #include <utility>
 #include <string>
 #include <functional>
-#include "./data.h"
-#include "./base.h"
 
 namespace xgboost {
+
 /*! \brief interface of objective function */
-class ObjFunction {
+class ObjFunction : public Configurable {
+ protected:
+  GenericParameter const* tparam_;
+
  public:
   /*! \brief virtual destructor */
-  virtual ~ObjFunction() {}
-  /*!
-   * \brief set configuration from pair iterators.
-   * \param begin The beginning iterator.
-   * \param end The end iterator.
-   * \tparam PairIter iterator<std::pair<std::string, std::string> >
-   */
-  template<typename PairIter>
-  inline void Configure(PairIter begin, PairIter end);
+  virtual ~ObjFunction() = default;
   /*!
    * \brief Configure the objective with the specified parameters.
    * \param args arguments to the objective function.
@@ -41,10 +41,11 @@ class ObjFunction {
    * \param iteration current iteration number.
    * \param out_gpair output of get gradient, saves gradient and second order gradient in
    */
-  virtual void GetGradient(const std::vector<bst_float>& preds,
+  virtual void GetGradient(const HostDeviceVector<bst_float>& preds,
                            const MetaInfo& info,
                            int iteration,
-                           std::vector<bst_gpair>* out_gpair) = 0;
+                           HostDeviceVector<GradientPair>* out_gpair) = 0;
+
   /*! \return the default evaluation metric for the objective */
   virtual const char* DefaultEvalMetric() const = 0;
   // the following functions are optional, most of time default implementation is good enough
@@ -52,13 +53,14 @@ class ObjFunction {
    * \brief transform prediction values, this is only called when Prediction is called
    * \param io_preds prediction values, saves to this vector as well
    */
-  virtual void PredTransform(std::vector<bst_float> *io_preds) {}
+  virtual void PredTransform(HostDeviceVector<bst_float> *io_preds) {}
+
   /*!
    * \brief transform prediction values, this is only called when Eval is called,
    *  usually it redirect to PredTransform
    * \param io_preds prediction values, saves to this vector as well
    */
-  virtual void EvalTransform(std::vector<bst_float> *io_preds) {
+  virtual void EvalTransform(HostDeviceVector<bst_float> *io_preds) {
     this->PredTransform(io_preds);
   }
   /*!
@@ -72,17 +74,11 @@ class ObjFunction {
   }
   /*!
    * \brief Create an objective function according to name.
+   * \param tparam Generic parameters.
    * \param name Name of the objective.
    */
-  static ObjFunction* Create(const std::string& name);
+  static ObjFunction* Create(const std::string& name, GenericParameter const* tparam);
 };
-
-// implementing configure.
-template<typename PairIter>
-inline void ObjFunction::Configure(PairIter begin, PairIter end) {
-  std::vector<std::pair<std::string, std::string> > vec(begin, end);
-  this->Configure(vec);
-}
 
 /*!
  * \brief Registry entry for objective factory functions.
@@ -97,7 +93,7 @@ struct ObjFunctionReg
  *
  * \code
  * // example of registering a objective
- * XGBOOST_REGISTER_OBJECTIVE(LinearRegression, "reg:linear")
+ * XGBOOST_REGISTER_OBJECTIVE(LinearRegression, "reg:squarederror")
  * .describe("Linear regression objective")
  * .set_body([]() {
  *     return new RegLossObj(LossType::kLinearSquare);

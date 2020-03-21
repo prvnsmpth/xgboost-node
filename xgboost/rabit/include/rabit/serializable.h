@@ -8,8 +8,7 @@
 #define RABIT_SERIALIZABLE_H_
 #include <vector>
 #include <string>
-#include "./internal/utils.h"
-#include "../dmlc/io.h"
+#include "rabit/internal/utils.h"
 
 namespace rabit {
 /*!

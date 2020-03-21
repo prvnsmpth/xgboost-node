@@ -1,8 +1,37 @@
-export CC  = gcc
+RABIT_BUILD_DMLC = 0
+
+ifeq ($(RABIT_BUILD_DMLC),1)
+    DMLC=../dmlc-core
+else
+    DMLC=../../dmlc-core
+endif
+
+MPICXX=../mpich/bin/mpicxx
+export LDFLAGS=  -L../lib -pthread -lm
+export CFLAGS = -Wall -O3 -Wno-unknown-pragmas
+
+export CC = gcc
 export CXX = g++
-export MPICXX = mpicxx
-export LDFLAGS=  -L../lib -pthread -lm  -lrt
-export CFLAGS = -Wall -O3 -msse2  -Wno-unknown-pragmas -fPIC -I../include  -std=c++0x
+
+
+#----------------------------
+# Settings for power and arm arch
+#----------------------------
+ARCH := $(shell uname -a)
+ifneq (,$(filter $(ARCH), armv6l armv7l powerpc64le ppc64le aarch64))
+	CFLAGS += -march=native
+else
+	CFLAGS += -msse2
+endif
+
+ifndef WITH_FPIC
+	WITH_FPIC = 1
+endif
+ifeq ($(WITH_FPIC), 1)
+	CFLAGS += -fPIC
+endif
+
+CFLAGS += -I../include -I $(DMLC)/include -std=c++11
 
 # specify tensor path
 BIN = speed_test model_recover local_recover lazy_recover
@@ -10,11 +39,17 @@ OBJ = $(RABIT_OBJ) speed_test.o model_recover.o local_recover.o lazy_recover.o
 MPIBIN = speed_test.mpi
 .PHONY: clean all lib mpi
 
+.PHONY: lib all
+
 all: $(BIN)
+
 lib:
-	cd ..;make;cd -
+	cd ..;make clean;make;cd -
+
+.PHONY: mpi
 mpi:
 	cd ..;make mpi;cd -
+
 # programs
 speed_test.o: speed_test.cc ../include/rabit/*.h lib mpi
 model_recover.o: model_recover.cc ../include/rabit/*.h lib
@@ -35,7 +70,8 @@ $(OBJ) :
 	$(CXX) -c $(CFLAGS) -o $@ $(firstword $(filter %.cpp %.c %.cc, $^) )
 
 $(MPIBIN) :
-	$(MPICXX) $(CFLAGS) -o $@ $(filter %.cpp %.o %.c %.cc, $^) $(LDFLAGS) -lrabit_mpi
+	$(MPICXX) $(CFLAGS) -I../mpich/include -shared -o $@ $(filter %.cpp %.o %.c %.cc, $^) \
+    ../lib/librabit_mpi.so $(LDFLAGS) -L../mpich/lib -Wl,-rpath,../mpich/lib -lmpi
 
 clean:
 	$(RM) $(OBJ) $(BIN) $(MPIBIN) $(MPIOBJ) *~ ../src/*~

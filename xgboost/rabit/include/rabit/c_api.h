@@ -11,14 +11,15 @@
 #define RABIT_EXTERN_C extern "C"
 #include <cstdio>
 #else
+#define RABIT_EXTERN_C
 #include <stdio.h>
-#endif
+#endif  // __cplusplus
 
 #if defined(_MSC_VER) || defined(_WIN32)
 #define RABIT_DLL RABIT_EXTERN_C __declspec(dllexport)
 #else
 #define RABIT_DLL RABIT_EXTERN_C
-#endif
+#endif  // defined(_MSC_VER) || defined(_WIN32)
 
 /*! \brief rabit unsigned long type */
 typedef unsigned long rbt_ulong;  // NOLINT(*)
@@ -31,23 +32,40 @@ typedef unsigned long rbt_ulong;  // NOLINT(*)
  *  from environment variables.
  * \param argc number of arguments in argv
  * \param argv the array of input arguments
+ * \return true if rabit is initialized successfully otherwise false
  */
-RABIT_DLL void RabitInit(int argc, char *argv[]);
+RABIT_DLL bool RabitInit(int argc, char *argv[]);
 
 /*!
  * \brief finalize the rabit engine,
  * call this function after you finished all jobs.
+ * \return true if rabit is initialized successfully otherwise false
  */
-RABIT_DLL void RabitFinalize();
+RABIT_DLL bool RabitFinalize(void);
 
-/*! \brief get rank of current process */
-RABIT_DLL int RabitGetRank();
+/*!
+ * \brief get rank of previous process in ring topology
+ * \return rank number of worker
+ * */
+RABIT_DLL int RabitGetRingPrevRank(void);
 
-/*! \brief get total number of process */
-RABIT_DLL int RabitGetWorldSize();
+/*!
+ * \brief get rank of current process
+ * \return rank number of worker
+ * */
+RABIT_DLL int RabitGetRank(void);
 
-/*! \brief get rank of current process */
-RABIT_DLL int RabitIsDistributed();
+/*!
+ * \brief get total number of process
+ * \return total world size
+ * */
+RABIT_DLL int RabitGetWorldSize(void);
+
+/*!
+ * \brief get rank of current process
+ * \return if rabit is distributed
+ * */
+RABIT_DLL int RabitIsDistributed(void);
 
 /*!
  * \brief print the msg to the tracker,
@@ -75,6 +93,30 @@ RABIT_DLL void RabitGetProcessorName(char *out_name,
  */
 RABIT_DLL void RabitBroadcast(void *sendrecv_data,
                               rbt_ulong size, int root);
+
+/*!
+ * \brief Allgather function, each node have a segment of data in the ring of sendrecvbuf,
+ *  the data provided by current node k is [slice_begin, slice_end),
+ *  the next node's segment must start with slice_end
+ *  after the call of Allgather, sendrecvbuf_ contains all the contents including all segments
+ *  use a ring based algorithm
+ *
+ * \param sendrecvbuf buffer for both sending and receiving data, it is a ring conceptually
+ * \param total_size total size of data to be gathered
+ * \param beginIndex beginning of the current slice in sendrecvbuf of type enum_dtype
+ * \param size_node_slice size of the current node slice
+ * \param size_prev_slice size of the previous slice i.e. slice of node (rank - 1) % world_size
+ * \param enum_dtype the enumeration of data type, see rabit::engine::mpi::DataType in engine.h of rabit include
+ * \return this function can return kSuccess, kSockError, kGetExcept, see ReturnType for details
+ * \sa ReturnType
+ */
+RABIT_DLL void RabitAllgather(void *sendrecvbuf,
+                                  size_t total_size,
+                                  size_t beginIndex,
+                                  size_t size_node_slice,
+                                  size_t size_prev_slice,
+                                  int enum_dtype);
+
 /*!
  * \brief perform in-place allreduce, on sendrecvbuf
  *        this function is NOT thread-safe
@@ -135,19 +177,20 @@ RABIT_DLL void RabitCheckPoint(const char *global_model,
 /*!
  * \return version number of current stored model,
  * which means how many calls to CheckPoint we made so far
+ * \return rabit version number
  */
-RABIT_DLL int RabitVersionNumber();
+RABIT_DLL int RabitVersionNumber(void);
 
 
 /*!
  * \brief a Dummy function,
  *  used to cause force link of C API  into the  DLL.
  * \code
- * // force link rabit C API library.
+ * \/\/force link rabit C API library.
  * static int must_link_rabit_ = RabitLinkTag();
  * \endcode
  * \return a dummy integer.
  */
-RABIT_DLL int RabitLinkTag();
+RABIT_DLL int RabitLinkTag(void);
 
 #endif  // RABIT_C_API_H_

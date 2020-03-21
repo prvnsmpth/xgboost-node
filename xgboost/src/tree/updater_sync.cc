@@ -1,5 +1,5 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014-2019 by Contributors
  * \file updater_sync.cc
  * \brief synchronize the tree in all distributed nodes
  */
@@ -7,7 +7,8 @@
 #include <vector>
 #include <string>
 #include <limits>
-#include "../common/sync.h"
+
+#include "xgboost/json.h"
 #include "../common/io.h"
 
 namespace xgboost {
@@ -21,9 +22,16 @@ DMLC_REGISTRY_FILE_TAG(updater_sync);
  */
 class TreeSyncher: public TreeUpdater {
  public:
-  void Init(const std::vector<std::pair<std::string, std::string> >& args) override {}
+  void Configure(const Args& args) override {}
 
-  void Update(const std::vector<bst_gpair> &gpair,
+  void LoadConfig(Json const& in) override {}
+  void SaveConfig(Json* p_out) const override {}
+
+  char const* Name() const override {
+    return "prune";
+  }
+
+  void Update(HostDeviceVector<GradientPair> *gpair,
               DMatrix* dmat,
               const std::vector<RegTree*> &trees) override {
     if (rabit::GetWorldSize() == 1) return;
@@ -31,14 +39,14 @@ class TreeSyncher: public TreeUpdater {
     common::MemoryBufferStream fs(&s_model);
     int rank = rabit::GetRank();
     if (rank == 0) {
-      for (size_t i = 0; i < trees.size(); ++i) {
-        trees[i]->Save(&fs);
+      for (auto tree : trees) {
+        tree->Save(&fs);
       }
     }
     fs.Seek(0);
     rabit::Broadcast(&s_model, 0);
-    for (size_t i = 0; i < trees.size(); ++i) {
-      trees[i]->Load(&fs);
+    for (auto tree : trees) {
+      tree->Load(&fs);
     }
   }
 };

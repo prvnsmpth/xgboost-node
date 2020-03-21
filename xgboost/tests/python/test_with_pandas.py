@@ -3,6 +3,7 @@ import numpy as np
 import xgboost as xgb
 import testing as tm
 import unittest
+import pytest
 
 try:
     import pandas as pd
@@ -10,7 +11,7 @@ except ImportError:
     pass
 
 
-tm._skip_if_no_pandas()
+pytestmark = pytest.mark.skipif(**tm.no_pandas())
 
 
 dpath = 'demo/data/'
@@ -21,23 +22,27 @@ class TestPandas(unittest.TestCase):
 
     def test_pandas(self):
 
-        df = pd.DataFrame([[1, 2., True], [2, 3., False]], columns=['a', 'b', 'c'])
+        df = pd.DataFrame([[1, 2., True], [2, 3., False]],
+                          columns=['a', 'b', 'c'])
         dm = xgb.DMatrix(df, label=pd.Series([1, 2]))
         assert dm.feature_names == ['a', 'b', 'c']
         assert dm.feature_types == ['int', 'float', 'i']
         assert dm.num_row() == 2
         assert dm.num_col() == 3
+        np.testing.assert_array_equal(dm.get_label(), np.array([1, 2]))
 
         # overwrite feature_names and feature_types
         dm = xgb.DMatrix(df, label=pd.Series([1, 2]),
-                         feature_names=['x', 'y', 'z'], feature_types=['q', 'q', 'q'])
+                         feature_names=['x', 'y', 'z'],
+                         feature_types=['q', 'q', 'q'])
         assert dm.feature_names == ['x', 'y', 'z']
         assert dm.feature_types == ['q', 'q', 'q']
         assert dm.num_row() == 2
         assert dm.num_col() == 3
 
         # incorrect dtypes
-        df = pd.DataFrame([[1, 2., 'x'], [2, 3., 'y']], columns=['a', 'b', 'c'])
+        df = pd.DataFrame([[1, 2., 'x'], [2, 3., 'y']],
+                          columns=['a', 'b', 'c'])
         self.assertRaises(ValueError, xgb.DMatrix, df)
 
         # numeric columns
@@ -47,6 +52,7 @@ class TestPandas(unittest.TestCase):
         assert dm.feature_types == ['int', 'float', 'i']
         assert dm.num_row() == 2
         assert dm.num_col() == 3
+        np.testing.assert_array_equal(dm.get_label(), np.array([1, 2]))
 
         df = pd.DataFrame([[1, 2., 1], [2, 3., 1]], columns=[4, 5, 6])
         dm = xgb.DMatrix(df, label=pd.Series([1, 2]))
@@ -79,33 +85,75 @@ class TestPandas(unittest.TestCase):
         assert dm.num_row() == 3
         assert dm.num_col() == 2
 
+        df_int = pd.DataFrame([[1, 1.1], [2, 2.2]], columns=[9, 10])
+        dm_int = xgb.DMatrix(df_int)
+        df_range = pd.DataFrame([[1, 1.1], [2, 2.2]], columns=range(9, 11, 1))
+        dm_range = xgb.DMatrix(df_range)
+        assert dm_int.feature_names == ['9', '10']  # assert not "9 "
+        assert dm_int.feature_names == dm_range.feature_names
+
+        # test MultiIndex as columns
+        df = pd.DataFrame(
+            [
+                (1, 2, 3, 4, 5, 6),
+                (6, 5, 4, 3, 2, 1)
+            ],
+            columns=pd.MultiIndex.from_tuples((
+                ('a', 1), ('a', 2), ('a', 3),
+                ('b', 1), ('b', 2), ('b', 3),
+            ))
+        )
+        dm = xgb.DMatrix(df)
+        assert dm.feature_names == ['a 1', 'a 2', 'a 3', 'b 1', 'b 2', 'b 3']
+        assert dm.feature_types == ['int', 'int', 'int', 'int', 'int', 'int']
+        assert dm.num_row() == 2
+        assert dm.num_col() == 6
+
     def test_pandas_label(self):
         # label must be a single column
         df = pd.DataFrame({'A': ['X', 'Y', 'Z'], 'B': [1, 2, 3]})
-        self.assertRaises(ValueError, xgb.core._maybe_pandas_label, df)
+        self.assertRaises(ValueError, xgb.core._maybe_pandas_data, df,
+                          None, None, 'label', 'float')
 
         # label must be supported dtype
         df = pd.DataFrame({'A': np.array(['a', 'b', 'c'], dtype=object)})
-        self.assertRaises(ValueError, xgb.core._maybe_pandas_label, df)
+        self.assertRaises(ValueError, xgb.core._maybe_pandas_data, df,
+                          None, None, 'label', 'float')
 
         df = pd.DataFrame({'A': np.array([1, 2, 3], dtype=int)})
-        result = xgb.core._maybe_pandas_label(df)
-        np.testing.assert_array_equal(result, np.array([[1.], [2.], [3.]], dtype=float))
-
+        result, _, _ = xgb.core._maybe_pandas_data(df, None, None,
+                                                   'label', 'float')
+        np.testing.assert_array_equal(result, np.array([[1.], [2.], [3.]],
+                                                       dtype=float))
         dm = xgb.DMatrix(np.random.randn(3, 2), label=df)
         assert dm.num_row() == 3
         assert dm.num_col() == 2
 
+    def test_pandas_weight(self):
+        kRows = 32
+        kCols = 8
+
+        X = np.random.randn(kRows, kCols)
+        y = np.random.randn(kRows)
+        w = np.random.randn(kRows).astype(np.float32)
+        w_pd = pd.DataFrame(w)
+        data = xgb.DMatrix(X, y, w_pd)
+
+        assert data.num_row() == kRows
+        assert data.num_col() == kCols
+
+        np.testing.assert_array_equal(data.get_weight(), w)
+
     def test_cv_as_pandas(self):
         dm = xgb.DMatrix(dpath + 'agaricus.txt.train')
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1, 'objective': 'binary:logistic'}
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
+                  'objective': 'binary:logistic'}
 
-        import pandas as pd
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10)
         assert isinstance(cv, pd.DataFrame)
         exp = pd.Index([u'test-error-mean', u'test-error-std',
                         u'train-error-mean', u'train-error-std'])
-        assert cv.columns.equals(exp)
+        assert len(cv.columns.intersection(exp)) == 4
 
         # show progress log (result is the same as above)
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
@@ -113,27 +161,27 @@ class TestPandas(unittest.TestCase):
         assert isinstance(cv, pd.DataFrame)
         exp = pd.Index([u'test-error-mean', u'test-error-std',
                         u'train-error-mean', u'train-error-std'])
-        assert cv.columns.equals(exp)
+        assert len(cv.columns.intersection(exp)) == 4
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
                     verbose_eval=True, show_stdv=False)
         assert isinstance(cv, pd.DataFrame)
         exp = pd.Index([u'test-error-mean', u'test-error-std',
                         u'train-error-mean', u'train-error-std'])
-        assert cv.columns.equals(exp)
+        assert len(cv.columns.intersection(exp)) == 4
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic', 'eval_metric': 'auc'}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10, as_pandas=True)
         assert 'eval_metric' in params
         assert 'auc' in cv.columns[0]
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic', 'eval_metric': ['auc']}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10, as_pandas=True)
         assert 'eval_metric' in params
         assert 'auc' in cv.columns[0]
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic', 'eval_metric': ['auc']}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
                     as_pandas=True, early_stopping_rounds=1)
@@ -141,19 +189,19 @@ class TestPandas(unittest.TestCase):
         assert 'auc' in cv.columns[0]
         assert cv.shape[0] < 10
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic'}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
                     as_pandas=True, metrics='auc')
         assert 'auc' in cv.columns[0]
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic'}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
                     as_pandas=True, metrics=['auc'])
         assert 'auc' in cv.columns[0]
 
-        params = {'max_depth': 2, 'eta': 1, 'silent': 1,
+        params = {'max_depth': 2, 'eta': 1, 'verbosity': 0,
                   'objective': 'binary:logistic', 'eval_metric': ['auc']}
         cv = xgb.cv(params, dm, num_boost_round=10, nfold=10,
                     as_pandas=True, metrics='error')

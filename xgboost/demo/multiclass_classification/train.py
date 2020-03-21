@@ -7,7 +7,7 @@ import xgboost as xgb
 
 # label need to be 0 to num_class -1
 data = np.loadtxt('./dermatology.data', delimiter=',',
-        converters={33: lambda x:int(x == '?'), 34: lambda x:int(x)-1})
+        converters={33: lambda x:int(x == '?'), 34: lambda x:int(x) - 1})
 sz = data.shape
 
 train = data[:int(sz[0] * 0.7), :]
@@ -47,5 +47,5 @@ bst = xgb.train(param, xg_train, num_round, watchlist)
 # get prediction, this is in 1D array, need reshape to (ndata, nclass)
 pred_prob = bst.predict(xg_test).reshape(test_Y.shape[0], 6)
 pred_label = np.argmax(pred_prob, axis=1)
-error_rate = np.sum(pred != test_Y) / test_Y.shape[0]
+error_rate = np.sum(pred_label != test_Y) / test_Y.shape[0]
 print('Test error using softprob = {}'.format(error_rate))

@@ -50,7 +50,7 @@ void XGModel::Predict(const Nan::FunctionCallbackInfo<v8::Value> &info)
   bst_ulong out_len;
   const float *out_result;
 
-  auto status = XGBoosterPredict(obj->handle, mat->GetHandle(), info[MASK]->Uint32Value(), info[NTREE]->Uint32Value(), &out_len, &out_result);
+  auto status = XGBoosterPredict(obj->handle, mat->GetHandle(), info[MASK]->Uint32Value(), info[NTREE]->Uint32Value(), 0, &out_len, &out_result);
 
   if (status != 0)
   {
@@ -148,7 +148,7 @@ void XGModel::PredictAsync(const Nan::FunctionCallbackInfo<v8::Value> &info)
 
 void PredictWorker::Execute()
 {
-  auto status = XGBoosterPredict(booster_handle, mat_handle, mask, ntree, &out_len, &out_result);
+  auto status = XGBoosterPredict(booster_handle, mat_handle, mask, ntree, 0, &out_len, &out_result);
   if (status != 0)
   {
     SetErrorMessage(XGBGetLastError());

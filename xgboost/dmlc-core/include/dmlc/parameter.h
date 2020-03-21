@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <cmath>
 #include <sstream>
 #include <limits>
 #include <map>
@@ -17,12 +18,16 @@
 #include <vector>
 #include <algorithm>
 #include <utility>
+#include <stdexcept>
 #include <iostream>
+#include <iomanip>
+#include <cerrno>
 #include "./base.h"
 #include "./json.h"
 #include "./logging.h"
 #include "./type_traits.h"
 #include "./optional.h"
+#include "./strtonum.h"
 
 namespace dmlc {
 // this file is backward compatible with non-c++11
@@ -45,6 +50,15 @@ struct ParamError : public dmlc::Error {
 template<typename ValueType>
 inline ValueType GetEnv(const char *key,
                         ValueType default_value);
+/*!
+ * \brief Set environment variable.
+ * \param key the name of environment variable.
+ * \param value the new value for key.
+ * \return The value received
+ */
+template<typename ValueType>
+inline void SetEnv(const char *key,
+                   ValueType value);
 
 /*! \brief internal namespace for parameter manangement */
 namespace parameter {
@@ -87,7 +101,7 @@ struct ParamFieldInfo {
 };
 
 /*!
- * \brief Parameter is the base type every parameter struct should inheritate from
+ * \brief Parameter is the base type every parameter struct should inherit from
  * The following code is a complete example to setup parameters.
  * \code
  *   struct Param : public dmlc::Parameter<Param> {
@@ -148,6 +162,41 @@ struct Parameter {
                                   kwargs.begin(), kwargs.end(),
                                   &unknown, parameter::kAllowUnknown);
     return unknown;
+  }
+
+  /*!
+   * \brief Update the parameter by keyword arguments.  This is same as
+   * `InitAllowUnknown', but without setting not provided parameters to their default.
+   *
+   * \tparam Container container type
+   *
+   * \param kwargs map of keyword arguments, or vector of pairs
+   * \param out_changed (optional) Output whether any parameter is changed during update.
+   *
+   * \throw ParamError when something go wrong.
+   * \return vector of pairs of unknown arguments.
+   */
+  template <typename Container>
+  std::vector<std::pair<std::string, std::string> >
+  UpdateAllowUnknown(Container const& kwargs, bool* out_changed = nullptr) {
+    std::vector<std::pair<std::string, std::string> > unknown;
+    bool changed {false};
+    changed = PType::__MANAGER__()->RunUpdate(static_cast<PType*>(this),
+                                              kwargs.begin(), kwargs.end(),
+                                              parameter::kAllowUnknown, &unknown, nullptr);
+    if (out_changed) { *out_changed = changed; }
+    return unknown;
+  }
+
+  /*!
+   * \brief Update the dict with values stored in parameter.
+   *
+   * \param dict The dictionary to be updated.
+   * \tparam Container container type
+   */
+  template<typename Container>
+  inline void UpdateDict(Container *dict) const {
+    PType::__MANAGER__()->UpdateDict(this->head(), dict);
   }
   /*!
    * \brief Return a dictionary representation of the parameters
@@ -231,7 +280,7 @@ struct Parameter {
  *   };
  * \endcode
  *
- * This macro need to be put in a source file so that registeration only happens once.
+ * This macro need to be put in a source file so that registration only happens once.
  * Refer to example code in Parameter for details
  *
  * \param PType the name of parameter struct.
@@ -273,7 +322,7 @@ struct Parameter {
 
 //! \endcond
 /*!
- * \brief internal namespace for parameter manangement
+ * \brief internal namespace for parameter management
  * There is no need to use it directly in normal case
  */
 namespace parameter {
@@ -286,7 +335,7 @@ namespace parameter {
 class FieldAccessEntry {
  public:
   FieldAccessEntry()
-      : has_default_(false) {}
+      : has_default_(false), index_(0) {}
   /*! \brief destructor */
   virtual ~FieldAccessEntry() {}
   /*!
@@ -301,6 +350,12 @@ class FieldAccessEntry {
    * \param value the value to be set
    */
   virtual void Set(void *head, const std::string &value) const = 0;
+  /*!
+   * \brief See if new and old values are the same
+   * \param head the pointer to the head of the struct
+   * \param value the value to be set
+   */
+  virtual bool Same(void* head, const std::string& value) const = 0;
   // check if value is OK
   virtual void Check(void *head) const {}
   /*!
@@ -325,6 +380,12 @@ class FieldAccessEntry {
   std::string type_;
   /*! \brief description of the parameter */
   std::string description_;
+  // internal offset of the field
+  ptrdiff_t offset_;
+  /*! \brief get pointer to parameter */
+  char* GetRawPtr(void* head) const {
+    return reinterpret_cast<char*>(head) + offset_;
+  }
   /*!
    * \brief print string representation of default value
    * \parma os the stream to print the docstring to.
@@ -358,7 +419,7 @@ class ParamManager {
     return it->second;
   }
   /*!
-   * \brief set parameter by keyword arguments.
+   * \brief Set parameter by keyword arguments and default values.
    * \param head head to the parameter field.
    * \param begin begin iterator of original kwargs
    * \param end end iterator of original kwargs
@@ -374,12 +435,49 @@ class ParamManager {
                       std::vector<std::pair<std::string, std::string> > *unknown_args,
                       parameter::ParamInitOption option) const {
     std::set<FieldAccessEntry*> selected_args;
+    RunUpdate(head, begin, end, option, unknown_args, &selected_args);
+    for (auto const& kv : entry_map_) {
+      if (selected_args.find(kv.second) == selected_args.cend()) {
+        kv.second->SetDefault(head);
+      }
+    }
+    for (std::map<std::string, FieldAccessEntry*>::const_iterator it = entry_map_.begin();
+         it != entry_map_.end(); ++it) {
+      if (selected_args.count(it->second) == 0) {
+        it->second->SetDefault(head);
+      }
+    }
+  }
+  /*!
+   * \brief Update parameters by keyword arguments.
+   *
+   * \tparam RandomAccessIterator iterator type
+   * \param head head to the parameter field.
+   * \param begin begin iterator of original kwargs
+   * \param end end iterator of original kwargs
+   * \param unknown_args optional, used to hold unknown arguments
+   *          When it is specified, unknown arguments will be stored into here, instead of raise an error
+   * \param selected_args The arguments used in update will be pushed into it, defaullt to nullptr.
+   * \throw ParamError when there is unknown argument and unknown_args == NULL, or required argument is missing.
+   */
+  template <typename RandomAccessIterator>
+  bool RunUpdate(void *head,
+                 RandomAccessIterator begin,
+                 RandomAccessIterator end,
+                 parameter::ParamInitOption option,
+                 std::vector<std::pair<std::string, std::string> > *unknown_args,
+                 std::set<FieldAccessEntry*>* selected_args = nullptr) const {
+    bool changed {false};
     for (RandomAccessIterator it = begin; it != end; ++it) {
-      FieldAccessEntry *e = Find(it->first);
-      if (e != NULL) {
+      if (FieldAccessEntry *e = Find(it->first)) {
+        if (!e->Same(head, it->second)) {
+          changed = true;
+        }
         e->Set(head, it->second);
         e->Check(head);
-        selected_args.insert(e);
+        if (selected_args) {
+          selected_args->insert(e);
+        }
       } else {
         if (unknown_args != NULL) {
           unknown_args->push_back(*it);
@@ -400,13 +498,7 @@ class ParamManager {
         }
       }
     }
-
-    for (std::map<std::string, FieldAccessEntry*>::const_iterator it = entry_map_.begin();
-         it != entry_map_.end(); ++it) {
-      if (selected_args.count(it->second) == 0) {
-        it->second->SetDefault(head);
-      }
-    }
+    return changed;
   }
   /*!
    * \brief internal function to add entry to manager,
@@ -483,6 +575,19 @@ class ParamManager {
     }
     return ret;
   }
+  /*!
+   * \brief Update the dictionary with values in parameter.
+   * \param head the head of the struct.
+   * \tparam Container The container type
+   * \return the parameter dictionary.
+   */
+  template<typename Container>
+  inline void UpdateDict(void * head, Container* dict) const {
+    for (std::map<std::string, FieldAccessEntry*>::const_iterator
+            it = entry_map_.begin(); it != entry_map_.end(); ++it) {
+      (*dict)[it->first] = it->second->GetStringValue(head);
+    }
+  }
 
  private:
   /*! \brief parameter struct name */
@@ -502,8 +607,8 @@ struct ParamManagerSingleton {
   ParamManager manager;
   explicit ParamManagerSingleton(const std::string &param_name) {
     PType param;
-    param.__DECLARE__(this);
     manager.set_name(param_name);
+    param.__DECLARE__(this);
   }
 };
 
@@ -515,7 +620,7 @@ class FieldEntryBase : public FieldAccessEntry {
   // entry type
   typedef TEntry EntryType;
   // implement set value
-  virtual void Set(void *head, const std::string &value) const {
+  void Set(void *head, const std::string &value) const override {
     std::istringstream is(value);
     is >> this->Get(head);
     if (!is.fail()) {
@@ -537,12 +642,27 @@ class FieldEntryBase : public FieldAccessEntry {
       throw dmlc::ParamError(os.str());
     }
   }
-  virtual std::string GetStringValue(void *head) const {
+
+  // Don't check this function for Undefined Behavior (UB), as the function
+  // reads from a possibly uninitialized field
+  DMLC_SUPPRESS_UBSAN
+  bool Same(void* head, std::string const& value) const override {
+    DType old = this->Get(head);
+    DType now;
+    std::istringstream is(value);
+    is >> now;
+    // don't require = operator
+    bool is_same = std::equal(
+        reinterpret_cast<char*>(&now), reinterpret_cast<char*>(&now) + sizeof(now),
+        reinterpret_cast<char*>(&old));
+    return is_same;
+  }
+  std::string GetStringValue(void *head) const override {
     std::ostringstream os;
     PrintValue(os, this->Get(head));
     return os.str();
   }
-  virtual ParamFieldInfo GetFieldInfo() const {
+  ParamFieldInfo GetFieldInfo() const override {
     ParamFieldInfo info;
     std::ostringstream os;
     info.name = key_;
@@ -559,7 +679,7 @@ class FieldEntryBase : public FieldAccessEntry {
     return info;
   }
   // implement set head to default value
-  virtual void SetDefault(void *head) const {
+  void SetDefault(void *head) const override {
     if (!has_default_) {
       std::ostringstream os;
       os << "Required parameter " << key_
@@ -601,17 +721,15 @@ class FieldEntryBase : public FieldAccessEntry {
   virtual void PrintValue(std::ostream &os, DType value) const { // NOLINT(*)
     os << value;
   }
-  virtual void PrintDefaultValueString(std::ostream &os) const {  // NOLINT(*)
+  void PrintDefaultValueString(std::ostream &os) const override {  // NOLINT(*)
     PrintValue(os, default_value_);
   }
   // get the internal representation of parameter
   // for example if this entry corresponds field param.learning_rate
   // then Get(&param) will return reference to param.learning_rate
   inline DType &Get(void *head) const {
-    return *(DType*)((char*)(head) + offset_);  // NOLINT(*)
+    return *(DType*)this->GetRawPtr(head);  // NOLINT(*)
   }
-  // internal offset of the field
-  ptrdiff_t offset_;
   // default value of field
   DType default_value_;
 };
@@ -642,18 +760,21 @@ class FieldEntryNumeric
       if (v < begin_ || v > end_) {
         std::ostringstream os;
         os << "value " << v << " for Parameter " << this->key_
-           << " exceed bound [" << begin_ << ',' << end_ <<']';
+           << " exceed bound [" << begin_ << ',' << end_ <<']' << '\n';
+        os << this->key_ << ": " << this->description_;
         throw dmlc::ParamError(os.str());
       }
     } else if (has_begin_ && v < begin_) {
         std::ostringstream os;
         os << "value " << v << " for Parameter " << this->key_
-           << " should be greater equal to " << begin_;
+           << " should be greater equal to " << begin_ << '\n';
+        os << this->key_ << ": " << this->description_;
         throw dmlc::ParamError(os.str());
     } else if (has_end_ && v > end_) {
         std::ostringstream os;
         os << "value " << v << " for Parameter " << this->key_
-           << " should be smaller equal to " << end_;
+           << " should be smaller equal to " << end_ << '\n';
+        os << this->key_ << ": " << this->description_;
         throw dmlc::ParamError(os.str());
     }
   }
@@ -939,11 +1060,7 @@ class FieldEntry<bool>
  protected:
   // print default string
   virtual void PrintValue(std::ostream &os, bool value) const {  // NOLINT(*)
-    if (value) {
-      os << "True";
-    } else {
-      os << "False";
-    }
+    os << static_cast<int>(value);
   }
 };
 
@@ -958,14 +1075,32 @@ class FieldEntry<float> : public FieldEntryNumeric<FieldEntry<float>, float> {
   typedef FieldEntryNumeric<FieldEntry<float>, float> Parent;
   // override set
   virtual void Set(void *head, const std::string &value) const {
+    size_t pos = 0;  // number of characters processed by dmlc::stof()
     try {
-      this->Get(head) = std::stof(value);
+      this->Get(head) = dmlc::stof(value, &pos);
     } catch (const std::invalid_argument &) {
       std::ostringstream os;
       os << "Invalid Parameter format for " << key_ << " expect " << type_
          << " but value=\'" << value << '\'';
       throw dmlc::ParamError(os.str());
+    } catch (const std::out_of_range&) {
+      std::ostringstream os;
+      os << "Out of range value for " << key_ << ", value=\'" << value << '\'';
+      throw dmlc::ParamError(os.str());
     }
+    CHECK_LE(pos, value.length());  // just in case
+    if (pos < value.length()) {
+      std::ostringstream os;
+      os << "Some trailing characters could not be parsed: \'"
+         << value.substr(pos) << "\'";
+      throw dmlc::ParamError(os.str());
+    }
+  }
+
+ protected:
+  // print the value
+  virtual void PrintValue(std::ostream &os, float value) const {  // NOLINT(*)
+    os << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
   }
 };
 
@@ -979,14 +1114,32 @@ class FieldEntry<double>
   typedef FieldEntryNumeric<FieldEntry<double>, double> Parent;
   // override set
   virtual void Set(void *head, const std::string &value) const {
+    size_t pos = 0;  // number of characters processed by dmlc::stod()
     try {
-      this->Get(head) = std::stod(value);
+      this->Get(head) = dmlc::stod(value, &pos);
     } catch (const std::invalid_argument &) {
       std::ostringstream os;
       os << "Invalid Parameter format for " << key_ << " expect " << type_
          << " but value=\'" << value << '\'';
       throw dmlc::ParamError(os.str());
+    } catch (const std::out_of_range&) {
+      std::ostringstream os;
+      os << "Out of range value for " << key_ << ", value=\'" << value << '\'';
+      throw dmlc::ParamError(os.str());
     }
+    CHECK_LE(pos, value.length());  // just in case
+    if (pos < value.length()) {
+      std::ostringstream os;
+      os << "Some trailing characters could not be parsed: \'"
+         << value.substr(pos) << "\'";
+      throw dmlc::ParamError(os.str());
+    }
+  }
+
+ protected:
+  // print the value
+  virtual void PrintValue(std::ostream &os, double value) const {  // NOLINT(*)
+    os << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
   }
 };
 #endif  // DMLC_USE_CXX11
@@ -999,12 +1152,30 @@ template<typename ValueType>
 inline ValueType GetEnv(const char *key,
                         ValueType default_value) {
   const char *val = getenv(key);
-  if (val == NULL) return default_value;
+  // On some implementations, if the var is set to a blank string (i.e. "FOO="), then
+  // a blank string will be returned instead of NULL.  In order to be consistent, if
+  // the environment var is a blank string, then also behave as if a null was returned.
+  if (val == nullptr || !*val) {
+    return default_value;
+  }
   ValueType ret;
   parameter::FieldEntry<ValueType> e;
   e.Init(key, &ret, ret);
   e.Set(&ret, val);
   return ret;
+}
+
+// implement SetEnv
+template<typename ValueType>
+inline void SetEnv(const char *key,
+                   ValueType value) {
+  parameter::FieldEntry<ValueType> e;
+  e.Init(key, &value, value);
+#ifdef _WIN32
+  _putenv_s(key, e.GetStringValue(&value).c_str());
+#else
+  setenv(key, e.GetStringValue(&value).c_str(), 1);
+#endif  // _WIN32
 }
 }  // namespace dmlc
 #endif  // DMLC_PARAMETER_H_
