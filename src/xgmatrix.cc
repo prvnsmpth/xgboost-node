@@ -27,8 +27,9 @@ void XGMatrix::Init(v8::Local<v8::Object> exports)
   Nan::SetPrototypeMethod(tpl, "col", GetCol);
   Nan::SetPrototypeMethod(tpl, "row", GetRow);
 
-  constructor.Reset(tpl->GetFunction());
-  exports->Set(Nan::New("CXGMatrix").ToLocalChecked(), tpl->GetFunction());
+  v8::Local<v8::Context> context = exports->CreationContext();
+  constructor.Reset(tpl->GetFunction(context).ToLocalChecked());
+  exports->Set(Nan::New("CXGMatrix").ToLocalChecked(), tpl->GetFunction(context).ToLocalChecked());
 }
 
 DMatrixHandle XGMatrix::GetHandle() { return handle; }
@@ -67,6 +68,7 @@ void XGMatrix::GetRow(const Nan::FunctionCallbackInfo<v8::Value> &info)
 
 void XGMatrix::NewMatrix(const Nan::FunctionCallbackInfo<v8::Value> &info)
 {
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
   Nan::HandleScope scope;
   const size_t INPUT_ARRAY = 0;
   const size_t INPUT_FILE = 1;
@@ -77,9 +79,9 @@ void XGMatrix::NewMatrix(const Nan::FunctionCallbackInfo<v8::Value> &info)
     DMatrixHandle res = nullptr;
     // 0: dense, 1: file
     if (info.Length() > 0 || !info[0]->IsNumber() ||
-        info[0]->Uint32Value() > 4)
+        info[0]->Uint32Value(context).ToChecked() > 4)
     {
-      switch (info[0]->Uint32Value())
+      switch (info[0]->Uint32Value(context).ToChecked())
       {
       case INPUT_ARRAY:
       {
@@ -158,6 +160,7 @@ void XGMatrix::NewMatrix(const Nan::FunctionCallbackInfo<v8::Value> &info)
 int XGMatrix::FromCSCR(const Nan::FunctionCallbackInfo<v8::Value> &info,
                        DMatrixHandle &res, bool column)
 {
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
   const size_t DATA = 1;
   const size_t INDPTR = 2;
   const size_t INDICES = 3;
@@ -179,9 +182,9 @@ int XGMatrix::FromCSCR(const Nan::FunctionCallbackInfo<v8::Value> &info,
         "'indices : Uint32Array', 'n : Int'");
     return 1;
   }
-  auto nindptr = info[NINDPTR]->Uint32Value();
-  auto nelem = info[NINDICES]->Uint32Value();
-  auto num_row = info[NNUM]->Uint32Value();
+  auto nindptr = info[NINDPTR]->Uint32Value(context).ToChecked();
+  auto nelem = info[NINDICES]->Uint32Value(context).ToChecked();
+  auto num_row = info[NNUM]->Uint32Value(context).ToChecked();
 
   Local<TypedArray> colptr = info[INDPTR].As<TypedArray>();
   Nan::TypedArrayContents<uint32_t> vcolptr(colptr);
@@ -241,6 +244,7 @@ int XGMatrix::FromCSCR(const Nan::FunctionCallbackInfo<v8::Value> &info,
 int XGMatrix::FromDense(const Nan::FunctionCallbackInfo<v8::Value> &info,
                         DMatrixHandle &res)
 {
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
   Nan::HandleScope scope;
   const size_t DATA = 1;
   const size_t ROW = 2;
@@ -258,15 +262,15 @@ int XGMatrix::FromDense(const Nan::FunctionCallbackInfo<v8::Value> &info,
   Nan::TypedArrayContents<float> vfloat(jsArray);
   if (*vfloat != NULL)
   {
-    auto rownum = info[ROW]->Uint32Value();
-    auto colnum = info[COL]->Uint32Value();
+    auto rownum = info[ROW]->Uint32Value(context).ToChecked();
+    auto colnum = info[COL]->Uint32Value(context).ToChecked();
     // for (size_t i = 0; i < rownum; i++) {
     //   for (size_t j = 0; j < colnum; j++) {
     //       printf("%8.6f ", (*vfloat)[i*colnum + j]);
     //   }
     //   printf("\n");
     // }
-    if (XGDMatrixCreateFromMat(*vfloat, rownum, colnum, info[MISSING]->NumberValue(),
+    if (XGDMatrixCreateFromMat(*vfloat, rownum, colnum, info[MISSING]->NumberValue(context).ToChecked(),
                                &res))
     {
       Nan::ThrowTypeError(XGBGetLastError());
@@ -285,6 +289,8 @@ int XGMatrix::FromDense(const Nan::FunctionCallbackInfo<v8::Value> &info,
 int XGMatrix::FromFile(const Nan::FunctionCallbackInfo<v8::Value> &info,
                        DMatrixHandle &res)
 {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
   Nan::HandleScope scope;
 
   if (info.Length() != 2 || !info[1]->IsString())
@@ -293,8 +299,8 @@ int XGMatrix::FromFile(const Nan::FunctionCallbackInfo<v8::Value> &info,
         "Wrong arguments: fromFile takes one argument 'file: String'");
     return 1;
   }
-  auto fname = info[1]->ToString();
-  String::Utf8Value value(fname);
+  auto fname = info[1]->ToString(context).ToLocalChecked();
+  String::Utf8Value value(isolate, fname);
   auto cstr = *value ? *value : "<string conversion failed>";
   try {
     if (XGDMatrixCreateFromFile(cstr, 1, &res))

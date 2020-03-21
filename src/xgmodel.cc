@@ -28,8 +28,9 @@ void XGModel::Init(v8::Local<v8::Object> exports)
   Nan::SetPrototypeMethod(tpl, "predict", Predict);
   Nan::SetPrototypeMethod(tpl, "predictAsync", PredictAsync);
 
-  constructor.Reset(tpl->GetFunction());
-  exports->Set(Nan::New("CXGModel").ToLocalChecked(), tpl->GetFunction());
+  v8::Local<v8::Context> context = exports->CreationContext();
+  constructor.Reset(tpl->GetFunction(context).ToLocalChecked());
+  exports->Set(Nan::New("CXGModel").ToLocalChecked(), tpl->GetFunction(context).ToLocalChecked());
 }
 
 void XGModel::Predict(const Nan::FunctionCallbackInfo<v8::Value> &info)
@@ -45,12 +46,13 @@ void XGModel::Predict(const Nan::FunctionCallbackInfo<v8::Value> &info)
     info.GetReturnValue().SetUndefined();
     return;
   }
-  XGMatrix *mat = Nan::ObjectWrap::Unwrap<XGMatrix>(info[0]->ToObject());
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+  XGMatrix *mat = Nan::ObjectWrap::Unwrap<XGMatrix>(info[0]->ToObject(context).ToLocalChecked());
   XGModel *obj = Nan::ObjectWrap::Unwrap<XGModel>(info.Holder());
   bst_ulong out_len;
   const float *out_result;
 
-  auto status = XGBoosterPredict(obj->handle, mat->GetHandle(), info[MASK]->Uint32Value(), info[NTREE]->Uint32Value(), 0, &out_len, &out_result);
+  auto status = XGBoosterPredict(obj->handle, mat->GetHandle(), info[MASK]->Uint32Value(context).ToChecked(), info[NTREE]->Uint32Value(context).ToChecked(), 0, &out_len, &out_result);
 
   if (status != 0)
   {
@@ -90,8 +92,11 @@ void XGModel::New(const Nan::FunctionCallbackInfo<v8::Value> &info)
       return;
     }
 
-    auto fname = info[0]->ToString();
-    String::Utf8Value value(fname);
+
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    auto fname = info[0]->ToString(context).ToLocalChecked();
+    String::Utf8Value value(isolate, fname);
     auto cstr = *value ? *value : "<string conversion failed>";
     if (XGBoosterLoadModel(res, cstr))
     {
@@ -133,10 +138,11 @@ void XGModel::PredictAsync(const Nan::FunctionCallbackInfo<v8::Value> &info)
     info.GetReturnValue().SetUndefined();
     return;
   }
-  XGMatrix *mat = Nan::ObjectWrap::Unwrap<XGMatrix>(info[0]->ToObject());
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+  XGMatrix *mat = Nan::ObjectWrap::Unwrap<XGMatrix>(info[0]->ToObject(context).ToLocalChecked());
   XGModel *obj = Nan::ObjectWrap::Unwrap<XGModel>(info.Holder());
-  auto mask = info[MASK]->Uint32Value();
-  auto ntree = info[NTREE]->Uint32Value();
+  auto mask = info[MASK]->Uint32Value(context).ToChecked();
+  auto ntree = info[NTREE]->Uint32Value(context).ToChecked();
 
   Nan::Callback *callback = new Nan::Callback(info[CALLBACK].As<Function>());
 
