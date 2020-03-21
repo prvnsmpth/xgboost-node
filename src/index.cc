@@ -7,4 +7,6 @@ void InitAll(v8::Local<v8::Object> exports)
   XGMatrix::Init(exports);
 }
 
-NODE_MODULE(xgboost, InitAll)
+NODE_MODULE_INIT() {
+  InitAll(exports);
+}
