@@ -7,7 +7,7 @@
   "scripts": {
     "test": "npm run compile; mocha",
     "cover": "istanbul cover _mocha",
-    "install": "bash ./build.sh; node-gyp rebuild",
+    "install": "bash ./build.sh || exit 0; node-gyp rebuild || exit 0",
     "compile": "tsc --p tsconfig.json"
   },
   "repository": {
