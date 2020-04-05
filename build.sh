@@ -6,29 +6,28 @@
 # See additional instruction in doc/build.md
 set -e
 
-if [[ -z ${BUILD_XGBOOST} ]]; then
-  echo "Building xgboost..."
-  cd ./xgboost;
+cd ./xgboost;
 
-  if make; then
-      echo "Successfully build multi-thread xgboost"
-  else
-      echo "-----------------------------"
-      echo "Building multi-thread xgboost failed"
-      echo "Start to build single-thread xgboost"
-      make clean_all
-      make config=make/minimum.mk
-      if [ $? -eq 0 ] ;then
-        echo "Successfully build single-thread xgboost"
-        echo "If you want multi-threaded version"
-        echo "See additional instructions in doc/build.md"
-      else
-        echo "Failed to build single-thread xgboost"
-      fi
-  fi
+echo "Building xgboost..."
+
+if make; then
+    echo "Successfully build multi-thread xgboost"
+else
+    echo "-----------------------------"
+    echo "Building multi-thread xgboost failed"
+    echo "Start to build single-thread xgboost"
+    make clean_all
+    make config=make/minimum.mk
+    if [ $? -eq 0 ] ;then
+      echo "Successfully build single-thread xgboost"
+      echo "If you want multi-threaded version"
+      echo "See additional instructions in doc/build.md"
+    else
+      echo "Failed to build single-thread xgboost"
+    fi
 fi
 
 touch ./rabit/lib/flag
 [ -e ./rabit/lib/librabit.a ] && cp ./rabit/lib/librabit.a ./rabit/lib/librabit_empty.a && echo -fopenmp > ./rabit/lib/flag;
 cd ../;
-echo "Done building xgboost-node.";
+echo "Done building xgboost.";
